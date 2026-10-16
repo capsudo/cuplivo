@@ -284,6 +284,16 @@ String _nestedDetailsHtml(int levels) {
   return out.toString();
 }
 
+/// How many markdown blocks the surface is rendering, one per visible block of
+/// the incremental document.
+int _markdownBlockCount(WidgetTester tester) => tester
+    .widgetList(
+      find.byWidgetPredicate(
+        (widget) => widget.runtimeType.toString() == '_CachedMarkdownBlock',
+      ),
+    )
+    .length;
+
 Widget _markdownHarness(
   String text, {
   double? width,
@@ -423,6 +433,34 @@ void main() {
       'Replacement bold',
     );
     await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  // A fence body is code: the dollars and tags inside it must reach the code
+  // view verbatim, never the inline-math or html paths. This is what the
+  // preprocessor's code masking is for, so it is also what decides whether
+  // that masking is still load-bearing.
+  testWidgets('a closed fence body keeps its dollars and tags', (tester) async {
+    const source = '```text\nprice \$5 and <b>bold</b> and \$x\$\n```';
+    await tester.pumpWidget(_markdownHarness(source));
+    await tester.pumpAndSettle();
+    final code = tester.widget<SelectableHighlightView>(
+      find.byType(SelectableHighlightView),
+    );
+    expect(code.source, 'price \$5 and <b>bold</b> and \$x\$');
+    expect(_mathWidgets(tester), isEmpty);
+  });
+
+  testWidgets('an unclosed fence body keeps its dollars and tags', (
+    tester,
+  ) async {
+    const source = '```text\nprice \$5 and <b>bold</b>';
+    await tester.pumpWidget(_markdownHarness(source, streaming: true));
+    await tester.pumpAndSettle();
+    final code = tester.widget<SelectableHighlightView>(
+      find.byType(SelectableHighlightView),
+    );
+    expect(code.source, 'price \$5 and <b>bold</b>');
+    expect(_mathWidgets(tester), isEmpty);
   });
 
   testWidgets('root fence parsing preserves the renderer whitespace contract', (
@@ -4663,6 +4701,26 @@ press5
     }
   });
 
+  testWidgets('MarkdownWithCodeHighlight keeps the app weight for emphasis '
+      'nested in other emphasis', (tester) async {
+    // The emitter draws emphasis from the bold component the surface renders
+    // with, so a bold inside italic must take the same ink as a top-level one.
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    try {
+      await tester.pumpWidget(_markdownHarness('这是 *斜体 **粗体** 结束*'));
+      await tester.pump();
+
+      final spans = _resolvedTextSpansFromRichText(tester);
+      final strongSpan = spans.singleWhere((span) => span.text == '粗体');
+
+      expect(strongSpan.style.fontWeight, FontWeight.w500);
+      final italicSpan = spans.singleWhere((span) => span.text == '斜体 ');
+      expect(italicSpan.style.fontStyle, FontStyle.italic);
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
+  });
+
   testWidgets('MarkdownWithCodeHighlight keeps p tag spacing compact', (
     tester,
   ) async {
@@ -5070,6 +5128,32 @@ void main() {
   );
 
   testWidgets(
+    'a streamed reply renders the same blocks as the same text in one piece',
+    (tester) async {
+      // A closed display formula must commit when the chunk behind it lands. A
+      // block list that depended on the chunking would leave the finished
+      // formula inside the growing, unstable tail, which is the only path that
+      // gets the streaming stabilization pass — the pass that may rewrite a
+      // dollar the document has already finished.
+      const chunked = 'before\n\n\$\$\na \$ b\n\nc\n\$\$\n\n';
+      const full =
+          '$chunked'
+          'after';
+      final text = ValueNotifier<String>(chunked);
+      await tester.pumpWidget(_streamingMarkdownHarness(text));
+      await tester.pump();
+      text.value = full;
+      await tester.pump();
+      final streamed = _markdownBlockCount(tester);
+      expect(streamed, 3);
+
+      await tester.pumpWidget(_markdownHarness(full, streaming: true));
+      await tester.pump();
+      expect(_markdownBlockCount(tester), streamed);
+    },
+  );
+
+  testWidgets(
     '512+ streaming italic paragraphs keep every completed body visible',
     (tester) async {
       final padding = List<String>.generate(
@@ -5376,6 +5460,30 @@ Fenced code body
       expect(find.textContaining(literal, findRichText: true), findsWidgets);
     },
   );
+
+  testWidgets('two identical details blocks expand independently', (
+    tester,
+  ) async {
+    const block = '<details><summary>s</summary>\n\nhidden\n</details>';
+    await tester.pumpWidget(_markdownHarness('$block\n\n$block'));
+    await tester.pump();
+
+    expect(find.text('s'), findsNWidgets(2));
+    expect(find.textContaining('hidden', findRichText: true), findsNothing);
+
+    await tester.tap(find.text('s').first);
+    await tester.pumpAndSettle();
+    expect(find.textContaining('hidden', findRichText: true), findsOneWidget);
+
+    // The second block is its own: opening the first left it collapsed.
+    await tester.tap(find.text('s').last);
+    await tester.pumpAndSettle();
+    expect(find.textContaining('hidden', findRichText: true), findsNWidgets(2));
+
+    await tester.tap(find.text('s').first);
+    await tester.pumpAndSettle();
+    expect(find.textContaining('hidden', findRichText: true), findsOneWidget);
+  });
 
   testWidgets('appending to the same tail keeps an expanded details open', (
     tester,

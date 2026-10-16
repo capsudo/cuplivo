@@ -42,10 +42,9 @@ import '../../core/services/workspace/file_link_resolver.dart';
 import '../../features/workspace/workspace_file_navigation.dart';
 import 'package:Cuplivo/desktop/html_preview_dialog.dart';
 import '../cache/byte_lru_cache.dart';
-import 'incremental_markdown_document.dart';
+import 'markdown_streaming_split.dart';
 import 'markdown_block_list.dart';
 import 'streaming_rich_text.dart';
-import 'streaming_code_fence.dart';
 import 'markdown_line_lexer.dart';
 import 'markdown_source_scan.dart';
 
@@ -91,6 +90,151 @@ void debugResetHighlightNodeCache() {
   debugHighlightParseCount = 0;
 }
 
+/// Which `<details>` blocks a markdown surface currently shows open.
+///
+/// Expansion is widget state, and it changes what a selection can reach: a
+/// collapsed block never builds its body, so the body contributes no copied
+/// text, while an open one's body is ordinary selectable rich text. The record
+/// is keyed by the block's own source, so a block recycled by viewport
+/// virtualization keeps its state, and a copy action can read back exactly what
+/// the renderer wrote.
+///
+/// A block with no entry here is in the state its own `open` attribute asks
+/// for, which is why [stateOf] answers null rather than false.
+class MarkdownDetailsExpansion {
+  final Map<String, bool> _expanded = <String, bool>{};
+
+  /// The state this block was last seen in, or null when it has none yet.
+  bool? stateOf(String source) => _expanded[source];
+
+  void set(String source, {required bool expanded}) {
+    _expanded[source] = expanded;
+  }
+}
+
+/// The component set a markdown surface renders with, in match order.
+///
+/// Shared by the renderer, the IR walk and the streaming splitter: a copied
+/// selection is mapped against the grammar that produced what the user sees,
+/// and a block boundary is decided by the same rules.
+///
+/// The flags are passed rather than the settings object, because the splitter
+/// builds its set where no provider is in scope (see
+/// `_MarkdownWithCodeHighlightState._createSplit`).
+({List<MarkdownComponent> global, List<MarkdownComponent> inline})
+markdownComponentsFor({
+  required bool enableMathRendering,
+  required bool enableDollarLatex,
+  required bool streaming,
+}) {
+  final components = List<MarkdownComponent>.from(
+    MarkdownComponent.globalComponents,
+  );
+  components.removeWhere((c) => c is LatexMathMultiLine || c is HTag);
+  final hrIdx = components.indexWhere((c) => c is HrLine);
+  if (hrIdx != -1) components[hrIdx] = SoftHrLine();
+  components.removeWhere((c) => c is BlockQuote);
+  final cbIdx = components.indexWhere((c) => c is CheckBoxMd);
+  if (cbIdx != -1) components[cbIdx] = ModernCheckBoxMd();
+  final rbIdx = components.indexWhere((c) => c is RadioButtonMd);
+  if (rbIdx != -1) components[rbIdx] = ModernRadioMd();
+  final tableIdx = components.indexWhere((c) => c is TableMd);
+  if (tableIdx != -1) components[tableIdx] = EscapeAwareTableMd();
+  // Prepend custom renderers in priority order.
+  components.removeWhere((c) => c is CodeBlockMd);
+  // Conditionally add LaTeX/math renderers
+  if (enableMathRendering) {
+    // Block-level LaTeX (e.g., $$...$$ or \[...\])
+    components.insert(0, LatexBlockScrollableMd());
+  }
+  components.insert(0, AtxHeadingMd());
+  // Ensure fenced code blocks take precedence over headings and other blocks
+  // so lines like "# comment" inside code fences are not parsed as headings.
+  components.insert(0, ModernBlockQuote());
+  components.insert(0, FencedCodeBlockMd(streaming: streaming));
+  // Inline components: keep defaults but make link parsing line-scoped
+  final inlineComponents = List<MarkdownComponent>.from(
+    MarkdownComponent.inlineComponents,
+  );
+  inlineComponents.removeWhere(
+    (c) => c is LatexMath || c is LatexMathMultiLine,
+  );
+  // Add whitelist-based HTML tag renderer (e.g., <br>)
+  inlineComponents.insert(0, HtmlAnchorMd());
+  inlineComponents.insert(0, AllowedHtmlTagsMd());
+
+  // Conditionally add inline LaTeX/math renderers
+  if (enableMathRendering) {
+    // Inline LaTeX: $...$ and \(...\)
+    if (enableDollarLatex) {
+      inlineComponents.insert(0, InlineLatexParenScrollableMd());
+      inlineComponents.insert(0, InlineLatexDollarScrollableMd());
+    } else {
+      // Only \(...\) inline
+      inlineComponents.insert(0, InlineLatexParenScrollableMd());
+    }
+  }
+
+  final boldIdxInline = inlineComponents.indexWhere((c) => c is BoldMd);
+  if (boldIdxInline != -1) {
+    inlineComponents[boldIdxInline] = EscapeAwareBoldMd();
+  }
+  final italicIdxInline = inlineComponents.indexWhere((c) => c is ItalicMd);
+  if (italicIdxInline != -1) {
+    inlineComponents[italicIdxInline] = EscapeAwareItalicMd();
+  }
+  final imageIdxInline = inlineComponents.indexWhere((c) => c is ImageMd);
+  if (imageIdxInline != -1) {
+    inlineComponents[imageIdxInline] = EscapeAwareImageMd();
+  }
+  final codeIdxInline = inlineComponents.indexWhere(
+    (c) => c is HighlightedText,
+  );
+  if (codeIdxInline != -1) {
+    inlineComponents[codeIdxInline] = EscapeAwareHighlightedTextMd();
+  }
+  final linkIdxInline = inlineComponents.indexWhere((c) => c is ATagMd);
+  if (linkIdxInline != -1) {
+    inlineComponents[linkIdxInline] = LineSafeLinkMd();
+  }
+  // An inline table is a table nested in emphasis, and it is drawn by the
+  // same widget as a top-level one: its cells are reached through the table's
+  // own area, never through the text around it.
+  final tableIdxInline = inlineComponents.indexWhere((c) => c is TableMd);
+  if (tableIdxInline != -1) {
+    inlineComponents[tableIdxInline] = EscapeAwareTableMd();
+  }
+  // Keep escaped punctuation out of block parsing so it cannot split
+  // \( ... \) math containing \{...\}; inline math is registered ahead of it.
+  inlineComponents.add(BackslashEscapeMd());
+  return (global: components, inline: inlineComponents);
+}
+
+/// The splitter a streaming markdown surface decides its block boundaries
+/// with.
+///
+/// Its grammar is the surface's — the same [markdownComponentsFor] list the
+/// renderer walks — with two deliberate differences. Display math is always
+/// on, because a display formula claims the blank runs inside it whether or
+/// not the setting renders math, which is what the old line scanner's
+/// always-enabled math pairing did; and `<details>` is claimed by a
+/// registry-less [DetailsHtmlMd], which matches a closed block in the raw
+/// source the way the rendering surface matches its placeholder token.
+///
+/// Built without a settings object, so the splitter can exist where no
+/// provider is in scope.
+MarkdownStreamingSplit markdownStreamingSplit() {
+  final set = markdownComponentsFor(
+    enableMathRendering: true,
+    enableDollarLatex: true,
+    streaming: true,
+  );
+  return MarkdownStreamingSplit(
+    global: [DetailsHtmlMd(), ...set.global],
+    inline: set.inline,
+  );
+}
+
 /// gpt_markdown with custom code block highlight and inline code styling.
 class MarkdownWithCodeHighlight extends StatefulWidget {
   const MarkdownWithCodeHighlight({
@@ -102,6 +246,7 @@ class MarkdownWithCodeHighlight extends StatefulWidget {
     this.streaming = false,
     this.useBlockRendering = false,
     this.conversationId,
+    this.detailsExpansion,
   });
 
   final String text;
@@ -119,6 +264,12 @@ class MarkdownWithCodeHighlight extends StatefulWidget {
   /// highlighting, tables and interactive state.
   final bool useBlockRendering;
 
+  /// Where this surface records which `<details>` blocks the user opened.
+  ///
+  /// Pass one in to read the state back when mapping a copied selection;
+  /// a surface without one keeps the state to itself.
+  final MarkdownDetailsExpansion? detailsExpansion;
+
   static const int _streamingTableMaxRows = 30;
   static const int _streamingHighlightMaxLines = 300;
   static const int _streamingHighlightMaxChars = 12000;
@@ -132,6 +283,38 @@ class MarkdownWithCodeHighlight extends StatefulWidget {
   @override
   State<MarkdownWithCodeHighlight> createState() =>
       _MarkdownWithCodeHighlightState();
+
+  /// The markdown IR for [source] under this surface's component set, ready to
+  /// map a copied selection onto.
+  ///
+  /// The walk uses the same components the renderer uses, so the text the
+  /// selection was made over and the markdown it re-emits come from one
+  /// grammar. A copy action rebuilds the document per copy — one parse — rather
+  /// than caching one per rendered widget.
+  static MdDocument markdownDocument(
+    String source, {
+    required SettingsProvider settings,
+    required bool streaming,
+    MarkdownDetailsExpansion? detailsExpansion,
+  }) {
+    final set = markdownComponentsFor(
+      enableMathRendering: settings.enableMathRendering,
+      enableDollarLatex: settings.enableDollarLatex,
+      streaming: streaming,
+    );
+    final registry = MarkdownDetailsRegistry(
+      enableMath: settings.enableMathRendering,
+    );
+    return MarkdownComponent.walkDocument(
+      source,
+      config: GptMarkdownConfig(
+        components: [DetailsHtmlMd(registry, detailsExpansion), ...set.global],
+        inlineComponents: set.inline,
+        preprocessBlocks: registry.rewrite,
+        streaming: streaming,
+      ),
+    );
+  }
 }
 
 class _MarkdownWithCodeHighlightState extends State<MarkdownWithCodeHighlight> {
@@ -146,10 +329,18 @@ class _MarkdownWithCodeHighlightState extends State<MarkdownWithCodeHighlight> {
 
   late String _renderText;
   Timer? _renderDebounce;
-  final IncrementalMarkdownDocument _incrementalDocument =
-      IncrementalMarkdownDocument();
-  final _codeFenceParser = StreamingCodeFenceParser();
-  final _separatorCache = Expando<(bool, bool, bool)>();
+  late final MarkdownStreamingSplit _incrementalDocument =
+      markdownStreamingSplit();
+  late final MarkdownDetailsExpansion _detailsExpansion =
+      widget.detailsExpansion ?? MarkdownDetailsExpansion();
+
+  /// One registry per surface, not one per block: a `<details>` block's
+  /// expansion state is keyed by where the block sits and by its text, and the
+  /// token that carries it has to survive every rebuild and append a streaming
+  /// reply goes through. Reset when the document is replaced rather than
+  /// appended to, rebuilt when the math flag it reads changes.
+  MarkdownDetailsRegistry? _detailsRegistry;
+  bool? _detailsRegistryMath;
   String? _liveBlockSource;
   String? _liveBlockNormalized;
   (bool, bool)? _liveBlockOptions;
@@ -165,6 +356,21 @@ class _MarkdownWithCodeHighlightState extends State<MarkdownWithCodeHighlight> {
         maxBytes: 4 << 20,
         sizeOf: (key, value) => (key.length + value.length) * 2,
       );
+
+  /// The registry a rendering pass rewrites details with. See [_detailsRegistry].
+  MarkdownDetailsRegistry _detailsRegistryFor(SettingsProvider settings) {
+    final existing = _detailsRegistry;
+    if (existing != null &&
+        _detailsRegistryMath == settings.enableMathRendering) {
+      return existing;
+    }
+    final registry = MarkdownDetailsRegistry(
+      enableMath: settings.enableMathRendering,
+    );
+    _detailsRegistry = registry;
+    _detailsRegistryMath = settings.enableMathRendering;
+    return registry;
+  }
 
   @override
   void initState() {
@@ -292,17 +498,12 @@ class _MarkdownWithCodeHighlightState extends State<MarkdownWithCodeHighlight> {
                 ? _metadataAppended
                 : null,
           )
-        : const <IncrementalMarkdownBlock>[];
+        : const <MarkdownStreamBlock>[];
     _previousBlockSourceUnchanged =
         useIncrementalBlocks && blockSourceUnchanged;
     final sourceAppended = _incrementalDocument.lastUpdateAppended;
-    final wholeFence = useIncrementalBlocks
-        ? null
-        : _codeFenceParser.update(sanitizedText.trimRight());
     final normalized = useIncrementalBlocks
         ? null
-        : wholeFence != null
-        ? sanitizedText
         : normalize(sanitizedText, streaming: widget.streaming);
     // Base text style (can be overridden by caller)
     final inkColor = _markdownInkColor(context);
@@ -315,83 +516,19 @@ class _MarkdownWithCodeHighlightState extends State<MarkdownWithCodeHighlight> {
           color: inkColor,
         );
 
+    final detailsRegistry = _detailsRegistryFor(settings);
+    // A document that was replaced rather than appended to starts its blocks
+    // over, so no block can be mistaken for the one it replaced.
+    if (!sourceAppended) detailsRegistry.reset();
+
     // Replace default components and add our own where needed
-    final components = List<MarkdownComponent>.from(
-      MarkdownComponent.globalComponents,
+    final set = markdownComponentsFor(
+      enableMathRendering: settings.enableMathRendering,
+      enableDollarLatex: settings.enableDollarLatex,
+      streaming: widget.streaming,
     );
-    components.removeWhere((c) => c is LatexMathMultiLine || c is HTag);
-    final hrIdx = components.indexWhere((c) => c is HrLine);
-    if (hrIdx != -1) components[hrIdx] = SoftHrLine();
-    components.removeWhere((c) => c is BlockQuote);
-    final cbIdx = components.indexWhere((c) => c is CheckBoxMd);
-    if (cbIdx != -1) components[cbIdx] = ModernCheckBoxMd();
-    final rbIdx = components.indexWhere((c) => c is RadioButtonMd);
-    if (rbIdx != -1) components[rbIdx] = ModernRadioMd();
-    final tableIdx = components.indexWhere((c) => c is TableMd);
-    if (tableIdx != -1) components[tableIdx] = EscapeAwareTableMd();
-    // Prepend custom renderers in priority order.
-    // Temporarily disable custom bold label line transformer to avoid
-    // interfering with block parsing for complex documents.
-    // components.insert(0, LabelValueLineMd());
-    components.removeWhere((c) => c is CodeBlockMd);
-    // Conditionally add LaTeX/math renderers
-    if (settings.enableMathRendering) {
-      // Block-level LaTeX (e.g., $$...$$ or \[...\])
-      components.insert(0, LatexBlockScrollableMd());
-    }
-    components.insert(0, AtxHeadingMd());
-    // Ensure fenced code blocks take precedence over headings and other blocks
-    // so lines like "# comment" inside code fences are not parsed as headings.
-    components.insert(0, ModernBlockQuote());
-    components.insert(0, FencedCodeBlockMd(streaming: widget.streaming));
-    // Inline components: keep defaults but make link parsing line-scoped
-    final inlineComponents = List<MarkdownComponent>.from(
-      MarkdownComponent.inlineComponents,
-    );
-    inlineComponents.removeWhere(
-      (c) => c is LatexMath || c is LatexMathMultiLine,
-    );
-    // Add whitelist-based HTML tag renderer (e.g., <br>)
-    inlineComponents.insert(0, HtmlAnchorMd());
-    inlineComponents.insert(0, AllowedHtmlTagsMd());
-
-    // Conditionally add inline LaTeX/math renderers
-    if (settings.enableMathRendering) {
-      // Inline LaTeX: $...$ and \(...\)
-      if (settings.enableDollarLatex) {
-        inlineComponents.insert(0, InlineLatexParenScrollableMd());
-        inlineComponents.insert(0, InlineLatexDollarScrollableMd());
-      } else {
-        // Only \(...\) inline
-        inlineComponents.insert(0, InlineLatexParenScrollableMd());
-      }
-    }
-
-    final boldIdxInline = inlineComponents.indexWhere((c) => c is BoldMd);
-    if (boldIdxInline != -1) {
-      inlineComponents[boldIdxInline] = EscapeAwareBoldMd();
-    }
-    final italicIdxInline = inlineComponents.indexWhere((c) => c is ItalicMd);
-    if (italicIdxInline != -1) {
-      inlineComponents[italicIdxInline] = EscapeAwareItalicMd();
-    }
-    final imageIdxInline = inlineComponents.indexWhere((c) => c is ImageMd);
-    if (imageIdxInline != -1) {
-      inlineComponents[imageIdxInline] = EscapeAwareImageMd();
-    }
-    final codeIdxInline = inlineComponents.indexWhere(
-      (c) => c is HighlightedText,
-    );
-    if (codeIdxInline != -1) {
-      inlineComponents[codeIdxInline] = EscapeAwareHighlightedTextMd();
-    }
-    final linkIdxInline = inlineComponents.indexWhere((c) => c is ATagMd);
-    if (linkIdxInline != -1) {
-      inlineComponents[linkIdxInline] = LineSafeLinkMd();
-    }
-    // Keep escaped punctuation out of block parsing so it cannot split
-    // \( ... \) math containing \{...\}; inline math is registered ahead of it.
-    inlineComponents.add(BackslashEscapeMd());
+    final components = set.global;
+    final inlineComponents = set.inline;
     // codeBuilder handles rendering. A custom BlockMd for fences can
     // interfere with block segmentation in some cases.
     // Resolve user preferred code font family (default to monospace)
@@ -420,14 +557,7 @@ class _MarkdownWithCodeHighlightState extends State<MarkdownWithCodeHighlight> {
     final themeSignature =
         '${Theme.of(context).brightness.index}-${cs.surface.toARGB32()}-${inkColor.toARGB32()}-${cs.primary.toARGB32()}-${cs.outlineVariant.toARGB32()}-${settings.enableMathRendering}-${settings.enableDollarLatex}-${widget.streaming}-${baseTextStyle?.fontSize}-${baseTextStyle?.height}-${baseTextStyle?.letterSpacing}-${baseTextStyle?.fontFamily}-$codeFontFamily-$appFontFamily-$documentRevision';
 
-    Widget buildMarkdown(
-      String markdown,
-      Key key, {
-      StreamingCodeFence? fence,
-    }) {
-      final detailsRegistry = MarkdownDetailsRegistry(
-        enableMath: settings.enableMathRendering,
-      );
+    Widget buildMarkdown(String markdown, Key key, {int base = 0}) {
       return GptMarkdown(
         key: key,
         markdown,
@@ -436,34 +566,20 @@ class _MarkdownWithCodeHighlightState extends State<MarkdownWithCodeHighlight> {
         // Disable built-in $...$ LaTeX so our custom scrollable handlers take over
         useDollarSignsForLatex: false,
         onLinkTap: (url, title) => _handleLinkTap(context, url),
-        preprocessBlocks: _sourceScan.hasHtml ? detailsRegistry.rewrite : null,
+        // The block's own offset, so a token names the block's place in the
+        // document rather than its place in this fragment.
+        preprocessBlocks: _sourceScan.hasHtml
+            ? (text) => detailsRegistry.rewrite(text, base: base)
+            : null,
         newlinesNormalized: !_sourceScan.hasCarriageReturns,
         generation: themeSignature,
         textBuilder: (text) =>
             StreamingRichText(text: text, streaming: widget.streaming),
         streaming: widget.streaming,
-        spanBuilder: fence == null
-            ? null
-            : (ctx, config) => [
-                WidgetSpan(
-                  alignment: PlaceholderAlignment.baseline,
-                  baseline: TextBaseline.alphabetic,
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Flexible(
-                        child: _buildFencedContent(
-                          fence.language,
-                          _unmaskHtmlTagStartsInsideFencedCode(fence.code),
-                          widget.streaming && !fence.closed,
-                          fence.closed,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-        components: [DetailsHtmlMd(detailsRegistry), ...components],
+        components: [
+          DetailsHtmlMd(detailsRegistry, _detailsExpansion),
+          ...components,
+        ],
         inlineComponents: inlineComponents,
         imageBuilder: (ctx, url, width, height) {
           if (KelivoLink.tryParse(url) != null) {
@@ -761,28 +877,18 @@ class _MarkdownWithCodeHighlightState extends State<MarkdownWithCodeHighlight> {
       );
     }
 
-    bool swallowsSeparator(IncrementalMarkdownBlock block) {
-      final cached = _separatorCache[block];
-      if (cached != null &&
-          cached.$1 == settings.enableMathRendering &&
-          cached.$2 == settings.enableDollarLatex) {
-        return cached.$3;
-      }
-      final result = _swallowsTrailingBlankLine(
-        preprocessedBlocks
-            ? block.text
-            : normalize(
-                block.text,
-                streaming: widget.streaming && !block.stable,
-              ),
-        mathEnabled: settings.enableMathRendering,
-      );
-      _separatorCache[block] = (
-        settings.enableMathRendering,
-        settings.enableDollarLatex,
-        result,
-      );
-      return result;
+    /// Whether the renderer lays out the gap after [block] itself, so a
+    /// separator would double it.
+    ///
+    /// The splitter reports which element matched into the block's blank run; a
+    /// rule is always rendered, while a display formula only claims that run
+    /// when math rendering is on — with it off those dollars are prose and the
+    /// gap is the renderer's.
+    bool absorbsSeparator(MarkdownStreamBlock block) {
+      final swallowedBy = block.swallowedBy;
+      if (swallowedBy == null) return false;
+      if (swallowedBy == MdNodeKind.math) return settings.enableMathRendering;
+      return true;
     }
 
     final markdownWidget = useIncrementalBlocks
@@ -791,19 +897,10 @@ class _MarkdownWithCodeHighlightState extends State<MarkdownWithCodeHighlight> {
             signature: themeSignature,
             itemBuilder: (_, i) {
               final block = sourceBlocks[i];
-              final fence = _codeFenceParser.update(
-                block.text.trimRight(),
-                sourceStart: block.start,
-                appendOnly: sourceAppended,
-              );
-              if (fence != null) {
-                _separatorCache[block] = (
-                  settings.enableMathRendering,
-                  settings.enableDollarLatex,
-                  false,
-                );
-              }
-              final content = fence != null || preprocessedBlocks
+              // A fence reaches the renderer as it stands: the walk claims it
+              // whether or not a closer has arrived, so the block's own text is
+              // what the code component parses.
+              final content = preprocessedBlocks
                   ? block.text
                   : normalize(
                       block.text,
@@ -815,7 +912,7 @@ class _MarkdownWithCodeHighlightState extends State<MarkdownWithCodeHighlight> {
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  if (previous != null && !swallowsSeparator(previous))
+                  if (previous != null && !absorbsSeparator(previous))
                     _MarkdownBlockSeparator(style: baseTextStyle),
                   _CachedMarkdownBlock(
                     source: block.text,
@@ -823,7 +920,7 @@ class _MarkdownWithCodeHighlightState extends State<MarkdownWithCodeHighlight> {
                     signature: themeSignature,
                     appendOnly: sourceAppended,
                     builder: (markdown, key) =>
-                        buildMarkdown(markdown, key, fence: fence),
+                        buildMarkdown(markdown, key, base: block.start),
                   ),
                 ],
               );
@@ -833,8 +930,7 @@ class _MarkdownWithCodeHighlightState extends State<MarkdownWithCodeHighlight> {
             source: sanitizedText,
             content: normalized!,
             signature: themeSignature,
-            builder: (markdown, key) =>
-                buildMarkdown(markdown, key, fence: wholeFence),
+            builder: (markdown, key) => buildMarkdown(markdown, key),
           );
 
     final result = appFontFamily.isEmpty
@@ -1064,70 +1160,10 @@ class _CachedMarkdownBlockState extends State<_CachedMarkdownBlock> {
   }
 }
 
-/// Whether a whole-document render would fold the blank line after [content]
-/// into the block itself, leaving no gap for a separator to reproduce.
-///
-/// [SoftHrLine] and [LatexBlockScrollableMd] close their pattern with `\s*$`.
-/// The match then runs past the newline that ends the block, so `NewLines`
-/// never sees the `\n\n` it needs and the render lays out no gap. Every other
-/// block — ATX headings included, which only allow horizontal whitespace —
-/// leaves the blank line behind, which is what [_MarkdownBlockSeparator]
-/// stands in for.
-///
-/// This walks in from the end of the block rather than matching a regex over
-/// the whole of it: a pattern like `\$\$[\s\S]*?\$\$\s*$` retries from every
-/// line-leading `$$`, which turns quadratic on a block full of unclosed math,
-/// and the check runs for every stable block on every streaming frame.
-bool _swallowsTrailingBlankLine(String content, {required bool mathEnabled}) {
-  final end = _lastNonWhitespace(content);
-  if (end == 0) return false;
-  if (_isSoftHrLine(content, _lineStartBefore(content, end), end)) return true;
-  return mathEnabled && markdownEndsWithDisplayMath(content, end);
-}
-
-/// One past the last non-whitespace code unit of [content].
-int _lastNonWhitespace(String content) {
-  var end = content.length;
-  while (end > 0 && _isWhitespace(content.codeUnitAt(end - 1))) {
-    end--;
-  }
-  return end;
-}
-
-/// The start of the line that [end] (exclusive) sits on.
-int _lineStartBefore(String content, int end) {
-  var i = end;
-  while (i > 0 && !_isLineBreak(content.codeUnitAt(i - 1))) {
-    i--;
-  }
-  return i;
-}
-
-/// Whether `[start, end)` holds nothing but a run of one rule marker, the way
-/// [SoftHrLine] matches it.
-bool _isSoftHrLine(String content, int start, int end) {
-  var i = start;
-  while (i < end && _isWhitespace(content.codeUnitAt(i))) {
-    i++;
-  }
-  if (i >= end) return false;
-  final marker = content.codeUnitAt(i);
-  if (marker == 0x2E3B) return i + 1 == end; // ⸻, matched on its own
-  if (marker != 0x2D && marker != 0x2A && marker != 0x5F) return false; // -*_
-  var run = 0;
-  while (i < end && content.codeUnitAt(i) == marker) {
-    i++;
-    run++;
-  }
-  return run >= 3 && i == end;
-}
-
-/// Whitespace as `\s` in a Dart pattern reads it, so leading and trailing runs
-/// are judged the same way the block patterns judge them.
+/// Whitespace as `\s` in a Dart pattern reads it: [_codeBlockStateKey] folds a
+/// run of it into one space, and the renderer's own patterns judge the same
+/// runs the same way.
 bool _isWhitespace(int unit) => markdownIsWhitespace(unit);
-
-/// The line terminators `^` and `$` recognise in a multi-line Dart pattern.
-bool _isLineBreak(int unit) => markdownIsLogicalLineBreak(unit);
 
 /// The blank line a whole-document render keeps between two blocks.
 ///
@@ -1295,7 +1331,14 @@ String _preprocessFences(
   out = out.replaceAllMapped(bulletFence, (m) => "${m[1]}\n```${m[2]}");
 
   // STEP 1: MASKING - Protect code blocks from LaTeX processing
-  // This prevents $...$ inside code from being converted to LaTeX
+  // This prevents $...$ inside code from being converted to LaTeX.
+  //
+  // This is load-bearing and not a leftover of the fence fast path the
+  // splitter replaced: with the mask disabled, a fence body's `$5` reaches the
+  // code view as `\(5\)` — the passes below run on this text whether or not
+  // the walk claims the fence. The tag half of the same mask is kept too, but
+  // no case in the suite distinguishes it: disabling it leaves every markdown
+  // test green, so it is unproven rather than proven necessary.
   final Map<String, String> codeMap = {};
   int codeCount = 0;
 
@@ -4207,25 +4250,6 @@ class _MarkdownTableCell extends StatelessWidget {
         return Alignment.centerLeft;
     }
   }
-
-  String _softBreakTableCellText(String input) {
-    // Keep markdown links intact. Inserting ZWSP into `[label](kelivo://…)`
-    // (long snake_case names are one token because `_` is not a wrap point)
-    // corrupts the scheme so KelivoLink.tryParse fails and launchUrl opens
-    // the system browser.
-    final link = RegExp(r'\[[^\]]*\]\([^)]*\)');
-    final buffer = StringBuffer();
-    var start = 0;
-    for (final match in link.allMatches(input)) {
-      buffer.write(
-        _softBreakLongTableTokens(input.substring(start, match.start)),
-      );
-      buffer.write(match.group(0));
-      start = match.end;
-    }
-    buffer.write(_softBreakLongTableTokens(input.substring(start)));
-    return buffer.toString();
-  }
 }
 
 class _MarkdownTableToolbar extends StatelessWidget {
@@ -4448,6 +4472,30 @@ String _markdownTableCell(String value) {
       .replaceAll('\r\n', '<br>')
       .replaceAll('\n', '<br>')
       .replaceAll('\r', '<br>');
+}
+
+/// The text a table cell shows: unmasked, trimmed, and soft-broken the same way
+/// the cell renderer breaks it.
+///
+/// Shared by the cell widget and the IR so a copied selection is matched
+/// against the text the cell actually contributes.
+String _softBreakTableCellText(String input) {
+  // Keep markdown links intact. Inserting ZWSP into `[label](kelivo://…)`
+  // (long snake_case names are one token because `_` is not a wrap point)
+  // corrupts the scheme so KelivoLink.tryParse fails and launchUrl opens
+  // the system browser.
+  final link = RegExp(r'\[[^\]]*\]\([^)]*\)');
+  final buffer = StringBuffer();
+  var start = 0;
+  for (final match in link.allMatches(input)) {
+    buffer.write(
+      _softBreakLongTableTokens(input.substring(start, match.start)),
+    );
+    buffer.write(match.group(0));
+    start = match.end;
+  }
+  buffer.write(_softBreakLongTableTokens(input.substring(start)));
+  return buffer.toString();
 }
 
 String _csvCell(String value) {
@@ -5358,6 +5406,11 @@ class SoftHrLine extends BlockMd {
       ),
     );
   }
+
+  @override
+  MdNode node(MdNodeContext ctx, String text) =>
+      // A rule is a painted line: it contributes no display text.
+      MdNode.gap(MdNodeKind.group, ctx.rangeOf(text));
 }
 
 // Robust fenced code block that takes precedence over other blocks
@@ -5390,6 +5443,13 @@ class FencedCodeBlockMd extends BlockMd {
     final isStreamingFence = streaming && !closed;
     return _buildFencedContent(lang, code, isStreamingFence, closed);
   }
+
+  @override
+  MdNode node(MdNodeContext ctx, String text) =>
+      // The code body is selectable only within the code view's own selection
+      // area, so it contributes no text to the surrounding document. The whole
+      // fence rides along when a selection spans it.
+      MdNode.gap(MdNodeKind.codeBlock, ctx.rangeOf(text));
 }
 
 Widget _buildFencedContent(
@@ -5450,6 +5510,12 @@ class LatexBlockScrollableMd extends BlockMd {
       ),
     );
   }
+
+  @override
+  MdNode node(MdNodeContext ctx, String text) =>
+      // The formula sits in a disabled SelectionContainer: it contributes no
+      // display text, and rides along when a selection spans it.
+      MdNode.gap(MdNodeKind.math, ctx.rangeOf(text));
 }
 
 /// Inline LaTeX `$...$` rendered in the text flow.
@@ -5473,6 +5539,12 @@ class InlineLatexScrollableMd extends InlineMd {
     final math = _renderMath(body, style: _inlineMathTextStyle(config.style));
     return _inlineMathSpan(math);
   }
+
+  @override
+  MdNode node(MdNodeContext ctx, String text) =>
+      // The formula sits in a disabled SelectionContainer: it contributes no
+      // display text, and rides along when a selection spans it.
+      MdNode.gap(MdNodeKind.math, ctx.rangeOf(text));
 }
 
 /// Inline LaTeX for dollar delimiters only: `$...$`
@@ -5503,6 +5575,22 @@ class InlineLatexDollarScrollableMd extends InlineMd {
       ],
     );
   }
+
+  @override
+  MdNode node(MdNodeContext ctx, String text) {
+    final m = exp.firstMatch(text);
+    final prefix = m?.group(1) ?? '';
+    // The formula sits in a disabled SelectionContainer, so it contributes no
+    // display text but still rides along in the re-emitted source.
+    return MdNode(
+      kind: MdNodeKind.group,
+      range: ctx.rangeOf(text),
+      children: [
+        if (prefix.isNotEmpty) MdNode.text(MdRange.all(prefix)),
+        MdNode.gap(MdNodeKind.math, MdRange.all(text.substring(prefix.length))),
+      ],
+    );
+  }
 }
 
 /// Inline LaTeX for parenthesis delimiters only: `\(...\)`
@@ -5523,6 +5611,12 @@ class InlineLatexParenScrollableMd extends InlineMd {
     final math = _renderMath(body, style: _inlineMathTextStyle(config.style));
     return _inlineMathSpan(math);
   }
+
+  @override
+  MdNode node(MdNodeContext ctx, String text) =>
+      // The formula sits in a disabled SelectionContainer: it contributes no
+      // display text, and rides along when a selection spans it.
+      MdNode.gap(MdNodeKind.math, ctx.rangeOf(text));
 }
 
 /// Single-line ATX. Opening `#{1,6}`, closing `#+`, horizontal blanks only.
@@ -5546,13 +5640,18 @@ class AtxHeadingMd extends BlockMd {
     final m = exp.firstMatch(text.trim());
     if (m == null) return const SizedBox.shrink();
     final hashes = m.group(1) ?? '#';
-    final raw = (m.group(2) ?? '').trim();
     final lvl = hashes.length;
     final level = lvl < 1 ? 1 : (lvl > 6 ? 6 : lvl);
 
     final innerCfg = config.copyWith(style: TextStyle());
+    // Rendered from the same nodes the IR reports, and walked the same way:
+    // a heading body is a document walk, as it is for node().
     final inner = TextSpan(
-      children: MarkdownComponent.generate(context, raw, innerCfg, true),
+      children: MdSpanEmitter(
+        context,
+        innerCfg,
+        includeGlobal: true,
+      ).emit(nodeOfElement(innerCfg, text).children),
     );
     final style = _headingTextStyle(context, config, level);
     // Slightly tighter spacing between headings and body
@@ -5636,94 +5735,17 @@ class AtxHeadingMd extends BlockMd {
       fontFamilyFallback: getPlatformFontFallback(),
     );
   }
-}
-
-// Setext-style headings (underlines with === or ---)
-class SetextHeadingMd extends BlockMd {
-  @override
-  String get expString => (r"^(.+?)\n(=+|-+)\s*$");
 
   @override
-  Widget build(BuildContext context, String text, GptMarkdownConfig config) {
-    final m = exp.firstMatch(text.trimRight());
-    if (m == null) return const SizedBox.shrink();
-    final title = (m.group(1) ?? '').trim();
-    final underline = (m.group(2) ?? '').trim();
-    final level = underline.startsWith('=') ? 1 : 2;
-
-    final innerCfg = config.copyWith(style: TextStyle());
-    final inner = TextSpan(
-      children: MarkdownComponent.generate(context, title, innerCfg, true),
-    );
-    final style = AtxHeadingMd()._headingTextStyle(context, config, level);
-    // Match the tighter spacing used in ATX headings
-    final top = level == 1 ? 10.0 : 9.0;
-    final bottom = 6.0;
-
-    return Padding(
-      padding: EdgeInsets.only(top: top, bottom: bottom),
-      child: DefaultTextStyle.merge(
-        // Use selection-aware renderer from config so headings can be selected/copied
-        style: style,
-        child: config.getRich(inner),
-      ),
-    );
-  }
-}
-
-// Label-value strong lines like "**作者:** 张三" should not render as heading-sized text
-class LabelValueLineMd extends InlineMd {
-  @override
-  // Treat this as an inline transform so it only affects the matched
-  // line segment and does not interfere with block parsing.
-  bool get inline => false;
-
-  @override
-  // 同时匹配两种写法：
-  // 1) **标签:** 值   （冒号在加粗内）
-  // 2) **标签**: 值   （冒号在加粗外）
-  // 支持半角/全角冒号
-  RegExp get exp =>
-      RegExp(r"(?:(?:^|\n)\*\*([^*]+?)\*\*\s*[：:]?\s+(.+)$)", multiLine: true);
-
-  @override
-  InlineSpan span(BuildContext context, String text, GptMarkdownConfig config) {
-    final match = exp.firstMatch(text);
-    if (match == null) return TextSpan(text: text, style: config.style);
-
-    // 提取并规范化标签与值
-    var rawLabel = (match.group(1) ?? '').trim();
-    final value = (match.group(2) ?? '').trim();
-    // 如果标签末尾自带冒号，去掉以避免重复
-    rawLabel = rawLabel.replaceFirst(RegExp(r"[：:]+$"), '');
-
-    final t = Theme.of(context).textTheme;
-    // 继承基础样式，确保字间距/行高一致
-    final base = (config.style ?? t.bodyMedium ?? TextStyle(fontSize: 14));
-    final labelStyle = base.copyWith(
-      fontWeight: AppFontWeights.strong,
-      color: _markdownInkColor(context),
-    );
-    final valueStyle = base.copyWith(
-      fontWeight: AppFontWeights.regular,
-      color: _markdownInkColor(context, 0.92),
-    );
-
-    // 将值部分继续按 markdown 解析，保证链接/引用等语法正常
-    final valueChildren = MarkdownComponent.generate(
-      context,
-      value,
-      config.copyWith(style: valueStyle),
-      true,
-    );
-
-    // 返回 TextSpan（而非 WidgetSpan）以保证在外层 RichText/SelectionArea 中可选择复制
-    return TextSpan(
-      children: [
-        TextSpan(text: rawLabel, style: labelStyle),
-        const TextSpan(text: '： '),
-        ...valueChildren,
-      ],
+  MdNode node(MdNodeContext ctx, String text) {
+    final m = exp.firstMatch(text.trim());
+    final raw = (m?.group(2) ?? '').trim();
+    return MdNode(
+      kind: MdNodeKind.heading,
+      range: ctx.rangeOf(text),
+      open: '${m?.group(1) ?? '#'} ',
+      // The body is parsed with the global components, as it is when rendered.
+      children: raw.isEmpty ? const [] : ctx.walk(raw, includeGlobal: true),
     );
   }
 }
@@ -5740,19 +5762,11 @@ class ModernBlockQuote extends InlineMd {
   @override
   InlineSpan span(BuildContext context, String text, GptMarkdownConfig config) {
     final match = exp.firstMatch(text);
-    final m = match?[0] ?? '';
-    final sb = StringBuffer();
-    for (final line in m.split('\n')) {
-      if (RegExp(r'^[ \t]*>').hasMatch(line)) {
-        var sub = line.trimLeft();
-        sub = sub.substring(1); // remove '>'
-        if (sub.startsWith(' ')) sub = sub.substring(1);
-        sb.writeln(sub);
-      } else {
-        sb.writeln(line);
-      }
-    }
-    final data = _unmaskBlockquoteFenceMarkers(sb.toString().trim());
+    // The body is the shared quote rule, so what is rendered and what the IR
+    // reports cannot disagree about the `>` markers.
+    final data = _unmaskBlockquoteFenceMarkers(
+      markdownQuoteText(match?[0] ?? ''),
+    );
     final theme = Theme.of(context);
     final cs = theme.colorScheme;
     final isDark = theme.brightness == Brightness.dark;
@@ -5811,6 +5825,21 @@ class ModernBlockQuote extends InlineMd {
       alignment: PlaceholderAlignment.baseline,
       baseline: TextBaseline.alphabetic,
       child: child,
+    );
+  }
+
+  @override
+  MdNode node(MdNodeContext ctx, String text) {
+    final m = exp.firstMatch(text);
+    final data = _unmaskBlockquoteFenceMarkers(
+      markdownQuoteText(m?[0] ?? text),
+    );
+    // A quote re-emits whole: its rendered text drops the `>` markers per
+    // line, so a partial re-emission could not put them back.
+    return MdNode.opaque(
+      MdNodeKind.quote,
+      ctx.rangeOf(text),
+      mdDisplayOf(ctx.walk(data, includeGlobal: true)),
     );
   }
 }
@@ -5979,6 +6008,19 @@ class ModernCheckBoxMd extends BlockMd {
       ),
     );
   }
+
+  @override
+  MdNode node(MdNodeContext ctx, String text) {
+    final m = exp.firstMatch(text.trim());
+    final item = m?.group(2);
+    final checked = m?.group(1) == 'x';
+    return MdNode(
+      kind: MdNodeKind.listItem,
+      range: ctx.rangeOf(text),
+      open: '${checked ? '[x]' : '[ ]'} ',
+      children: item == null ? const [] : ctx.walk(item),
+    );
+  }
 }
 
 // Modern radio (optional): circle with primary dot when selected
@@ -6042,6 +6084,18 @@ class ModernRadioMd extends BlockMd {
           Flexible(child: child),
         ],
       ),
+    );
+  }
+
+  @override
+  MdNode node(MdNodeContext ctx, String text) {
+    final m = exp.firstMatch(text.trim());
+    final item = m?.group(2);
+    return MdNode(
+      kind: MdNodeKind.listItem,
+      range: ctx.rangeOf(text),
+      open: '(${m?.group(1) == 'x' ? 'x' : ' '}) ',
+      children: item == null ? const [] : ctx.walk(item),
     );
   }
 }
@@ -6122,6 +6176,13 @@ class EscapeAwareTableMd extends TableMd {
       config,
     );
   }
+
+  @override
+  MdNode node(MdNodeContext ctx, String text) =>
+      // A table owns its selection: its cells are reached through the table's
+      // own area, never through the text around it (measured on every
+      // platform). The whole table rides along when a selection spans it.
+      MdNode.gap(MdNodeKind.table, ctx.rangeOf(text));
 }
 
 // Prevent link regex from spanning across lines (dotAll=true in engine).
@@ -6142,24 +6203,10 @@ class EscapeAwareBoldMd extends BoldMd {
   RegExp get exp =>
       RegExp(r"(?<![\\*])\*\*(?!\s)(.+?)(?<![\s\\])\*\*(?!\*)", dotAll: true);
 
+  // Emphasis renders from its IR node, so the app only declares the ink it
+  // draws with; the emitter reads this from the component set.
   @override
-  InlineSpan span(BuildContext context, String text, GptMarkdownConfig config) {
-    final match = exp.firstMatch(text.trim());
-    final conf = config.copyWith(
-      style:
-          config.style?.copyWith(fontWeight: AppFontWeights.strong) ??
-          TextStyle(fontWeight: AppFontWeights.strong),
-    );
-    return TextSpan(
-      children: MarkdownComponent.generate(
-        context,
-        '${match?[1]}',
-        conf,
-        false,
-      ),
-      style: conf.style,
-    );
-  }
+  FontWeight get emphasisWeight => AppFontWeights.strong;
 }
 
 class EscapeAwareItalicMd extends ItalicMd {
@@ -6190,18 +6237,29 @@ class BackslashEscapeMd extends InlineMd {
 
   @override
   InlineSpan span(BuildContext context, String text, GptMarkdownConfig config) {
-    final m = exp.firstMatch(text);
-    if (m == null) return TextSpan(text: text, style: config.style);
-    final ch = m.group(1) ?? '';
     // Render only the escaped character (drop the backslash)
-    return TextSpan(text: ch, style: config.style);
+    return TextSpan(text: _escapedOf(text), style: config.style);
   }
+
+  @override
+  MdNode node(MdNodeContext ctx, String text) {
+    // Only the escaped character is shown; the pair re-emits whole.
+    return MdNode.opaque(MdNodeKind.group, ctx.rangeOf(text), _escapedOf(text));
+  }
+
+  /// The character an escape pair shows: the escaped punctuation, or the
+  /// element itself when it is not a pair — which its own `exp` never lets
+  /// through. Shared by the rendered span and the IR node.
+  String _escapedOf(String text) => exp.firstMatch(text)?.group(1) ?? text;
 }
 
 class DetailsHtmlMd extends BlockMd {
-  DetailsHtmlMd([this.registry]);
+  DetailsHtmlMd([this.registry, this.expansion]);
 
   final MarkdownDetailsRegistry? registry;
+
+  /// The record a copy action reads expansion from, when the surface has one.
+  final MarkdownDetailsExpansion? expansion;
 
   @override
   RegExp get exp => RegExp(
@@ -6225,10 +6283,32 @@ class DetailsHtmlMd extends BlockMd {
     final body = parsed.body.trim();
     return _DetailsHtmlBlock(
       summary: _plainHtmlText(parsed.summary).trim(),
-      body: registry?.rewrite(body) ?? body,
+      body: _rewriteBody(body, parsed, text),
       initiallyExpanded: parsed.initiallyExpanded,
       config: config,
+      expansion: expansion,
+      expansionKey: expansionKeyOf(parsed, text),
     );
+  }
+
+  /// The key this block's expansion state is recorded under.
+  ///
+  /// The registry keys a block by where it sits in the document together with
+  /// its own text, so two identical blocks keep their own state, a block keeps
+  /// its state while the tail it sits in grows, and a block that replaced
+  /// another at the same offset starts collapsed instead of inheriting. With no
+  /// registry the block's text is all there is to key on.
+  String expansionKeyOf(MarkdownDetailsBlock parsed, String text) =>
+      registry?.expansionKeyFor(text) ?? parsed.source;
+
+  /// The body with its own blocks tokenized, at offsets that stay absolute in
+  /// the document: a nested block's key must not depend on where the surface
+  /// happened to start the text it rewrote.
+  String _rewriteBody(String body, MarkdownDetailsBlock parsed, String text) {
+    final registry = this.registry;
+    if (registry == null || body.isEmpty) return body;
+    final offset = registry.offsetOf(text);
+    return registry.rewrite(body, base: (offset ?? 0) + parsed.bodyOffset);
   }
 
   static String _plainHtmlText(String input) {
@@ -6236,6 +6316,26 @@ class DetailsHtmlMd extends BlockMd {
         .replaceAll(RegExp(r"<br\s*/?>", caseSensitive: false), '\n')
         .replaceAll(RegExp(r"<[^>]+>"), '')
         .trim();
+  }
+
+  @override
+  MdNode node(MdNodeContext ctx, String text) {
+    final parsed = registry?.lookup(text) ?? markdownParseDetails(text);
+    if (parsed == null) return MdNode.text(ctx.rangeOf(text));
+    // A collapsed block shows its summary alone; the body is built only while
+    // the block is open, and then it is selectable like any other text. The
+    // record decides, and a block with no recorded state follows its own
+    // `open` attribute.
+    final open =
+        expansion?.stateOf(expansionKeyOf(parsed, text)) ??
+        parsed.initiallyExpanded;
+    final body = parsed.body.trim();
+    return MdNode.opaque(
+      MdNodeKind.details,
+      MdRange(parsed.source, 0, parsed.source.length),
+      '${_plainHtmlText(parsed.summary).trim()}'
+      '${open && body.isNotEmpty ? mdDisplayOf(ctx.walk(_rewriteBody(body, parsed, text), includeGlobal: true)) : ''}',
+    );
   }
 }
 
@@ -6245,6 +6345,8 @@ class _DetailsHtmlBlock extends StatefulWidget {
     required this.body,
     required this.initiallyExpanded,
     required this.config,
+    this.expansion,
+    this.expansionKey,
   });
 
   final String summary;
@@ -6252,12 +6354,24 @@ class _DetailsHtmlBlock extends StatefulWidget {
   final bool initiallyExpanded;
   final GptMarkdownConfig config;
 
+  /// The surface's record of which blocks are open, and this block's key in it.
+  final MarkdownDetailsExpansion? expansion;
+  final String? expansionKey;
+
   @override
   State<_DetailsHtmlBlock> createState() => _DetailsHtmlBlockState();
 }
 
 class _DetailsHtmlBlockState extends State<_DetailsHtmlBlock> {
-  late bool _expanded = widget.initiallyExpanded;
+  // A re-mounted block (viewport virtualization recycles these) resumes the
+  // state the surface recorded; only a block with no record falls back to its
+  // own `open` attribute.
+  late bool _expanded = _recordedExpansion ?? widget.initiallyExpanded;
+
+  bool? get _recordedExpansion {
+    final key = widget.expansionKey;
+    return key == null ? null : widget.expansion?.stateOf(key);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -6294,7 +6408,13 @@ class _DetailsHtmlBlockState extends State<_DetailsHtmlBlock> {
         mainAxisSize: MainAxisSize.min,
         children: [
           IosCardPress(
-            onTap: () => setState(() => _expanded = !_expanded),
+            onTap: () => setState(() {
+              _expanded = !_expanded;
+              final key = widget.expansionKey;
+              if (key != null) {
+                widget.expansion?.set(key, expanded: _expanded);
+              }
+            }),
             baseColor: Colors.transparent,
             borderRadius: BorderRadius.circular(16),
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
@@ -6415,6 +6535,17 @@ class HtmlAnchorMd extends InlineMd {
 
   static String _stripTags(String input) =>
       input.replaceAll(RegExp(r"<[^>]+>"), '').trim();
+  @override
+  MdNode node(MdNodeContext ctx, String text) {
+    final m = exp.firstMatch(text);
+    if (m == null) return MdNode.text(ctx.rangeOf(text));
+    // The anchor shows its text and re-emits its whole tag when covered.
+    return MdNode.opaque(
+      MdNodeKind.link,
+      ctx.rangeOf(text),
+      _stripTags(m.group(3) ?? ''),
+    );
+  }
 }
 
 /// Whitelist-based HTML tag renderer.
@@ -6426,15 +6557,26 @@ class AllowedHtmlTagsMd extends InlineMd {
   );
 
   @override
-  InlineSpan span(BuildContext context, String text, GptMarkdownConfig config) {
-    if (RegExp(r"<br\s*/?>", caseSensitive: false).hasMatch(text)) {
-      return const TextSpan(text: '\n');
-    }
-    if (RegExp(r"<\/p\s*>", caseSensitive: false).hasMatch(text)) {
-      return const TextSpan(text: '\n');
-    }
-    return const TextSpan(text: '');
+  InlineSpan span(
+    BuildContext context,
+    String text,
+    GptMarkdownConfig config,
+  ) => TextSpan(text: _displayOf(text));
+
+  @override
+  MdNode node(MdNodeContext ctx, String text) {
+    // A tag that renders as nothing re-emits as nothing; a line break keeps
+    // its newline.
+    return MdNode.opaque(MdNodeKind.group, ctx.rangeOf(text), _displayOf(text));
   }
+
+  /// What a whitelisted tag shows: a line break for the tags that stand for
+  /// one, and nothing for the paragraph wrapper the renderer only uses to end
+  /// a block. Shared by the rendered span and the IR node.
+  static String _displayOf(String text) =>
+      RegExp(r"<br\s*/?>|<\/p\s*>", caseSensitive: false).hasMatch(text)
+      ? '\n'
+      : '';
 }
 
 /// A selectable version of HighlightView that allows users to select
