@@ -3,11 +3,13 @@ import "../../../support/business_test_harness.dart";
 import 'package:Cuplivo/core/models/chat_message.dart';
 import 'package:Cuplivo/core/providers/settings_provider.dart';
 import 'package:Cuplivo/core/providers/tts_provider.dart';
+import 'package:Cuplivo/core/providers/user_provider.dart';
 import 'package:Cuplivo/features/chat/utils/selection_markdown_memory.dart';
 import 'package:Cuplivo/features/chat/widgets/chat_message_widget.dart';
 import 'package:Cuplivo/features/home/services/ask_user_interaction_service.dart';
 import 'package:Cuplivo/features/home/services/tool_approval_service.dart';
 import 'package:Cuplivo/l10n/app_localizations.dart';
+import 'package:Cuplivo/shared/widgets/markdown_with_highlight.dart';
 import 'package:Cuplivo/shared/widgets/sanitizing_selection_area.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -34,6 +36,13 @@ ChatMessage _message(String id, String content, {bool streaming = false}) =>
       isStreaming: streaming,
     );
 
+ChatMessage _userMessage(String id, String content) => ChatMessage(
+  role: 'user',
+  content: content,
+  conversationId: 'conversation-selection-markdown',
+  id: id,
+);
+
 Future<void> _pumpMessages(
   WidgetTester tester,
   List<ChatMessage> messages, {
@@ -56,6 +65,9 @@ Future<void> _pumpMessages(
         ),
         ChangeNotifierProvider<ToolApprovalService>.value(
           value: ToolApprovalService(),
+        ),
+        ChangeNotifierProvider<UserProvider>(
+          create: (_) => UserProvider(preferences: harness.preferences),
         ),
         ChangeNotifierProvider<AskUserInteractionService>.value(
           value: AskUserInteractionService(),
@@ -88,9 +100,10 @@ Future<void> _pumpMessages(
 Future<void> _pumpAssistant(
   WidgetTester tester, {
   bool streaming = false,
+  String content = _content,
 }) async {
   await _pumpMessages(tester, [
-    _message('assistant-1', _content, streaming: streaming),
+    _message('assistant-1', content, streaming: streaming),
   ]);
 }
 
@@ -307,5 +320,121 @@ void main() {
 
     await tester.pumpWidget(const SizedBox.shrink());
     expect(SelectionMarkdownMemory.instance.markdownForSelection(), isNull);
+  });
+
+  testWidgets('the Markdown item keeps a table the selection spans', (
+    tester,
+  ) async {
+    // The cells are paragraphs of the bubble's own selection owner, so the
+    // selection reports their text. The Markdown mapping has to declare that
+    // same display text — a table that contributed none left the mapping
+    // unmatched, and the item silently handed back the plain selection.
+    final recorder = _ClipboardRecorder()..install(tester);
+    markdownTableTargetPlatformOverride = TargetPlatform.windows;
+    addTearDown(() => markdownTableTargetPlatformOverride = null);
+    await _pumpAssistant(
+      tester,
+      content:
+          'before\n\n| head | second |\n| --- | --- |\n'
+          '| alpha | bravo |\n\nafter',
+    );
+
+    final item = await _markdownMenuItem(tester);
+    item.onPressed!();
+    await tester.pump();
+
+    expect(recorder.text, contains('before'));
+    expect(recorder.text, contains('after'));
+    expect(recorder.text, contains('| alpha | bravo |'));
+  });
+
+  testWidgets('the Markdown item keeps the fence of a code block', (
+    tester,
+  ) async {
+    // The block's body is part of the display space a selection reports, so the
+    // walk has to declare it — otherwise a selection over the block matched
+    // nothing and the item handed back the plain selection.
+    final recorder = _ClipboardRecorder()..install(tester);
+    await _pumpAssistant(
+      tester,
+      content: 'before\n\n```dart\nvoid main() {}\n```\n\nafter',
+    );
+
+    final item = await _markdownMenuItem(tester);
+    item.onPressed!();
+    await tester.pump();
+
+    expect(recorder.text, contains('```dart'));
+    expect(recorder.text, contains('void main() {}'));
+    expect(recorder.text, contains('after'));
+  });
+
+  testWidgets('a mobile user bubble selects its code block, not its prose', (
+    tester,
+  ) async {
+    // The user bubble provides no selection owner on mobile, on purpose: a
+    // SelectionArea over it would take the long-press that opens the message
+    // menu. What the surface cannot reach, the block owns itself — without that,
+    // a fenced block in a sent message is not selectable at all, which is what
+    // master's own `SelectableText` gave it.
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    await _pumpMessages(tester, [
+      _userMessage(
+        'user-1',
+        'prose words here\n\n```dart\nvoid main() {}\n```',
+      ),
+    ]);
+
+    expect(find.byType(SanitizingSelectionArea), findsNothing);
+    // Only the block owns a region: the renderer itself is outside it, which is
+    // what keeps the long-press over the prose for the message menu.
+    expect(find.byType(SelectableRegion), findsOneWidget);
+    expect(
+      find.ancestor(
+        of: find.byType(MarkdownWithCodeHighlight),
+        matching: find.byType(SelectableRegion),
+      ),
+      findsNothing,
+    );
+    expect(
+      find.descendant(
+        of: find.byType(SelectableHighlightView),
+        matching: find.byType(SelectableRegion),
+      ),
+      findsOneWidget,
+    );
+
+    // Reset inside the body: the framework's invariant check runs before
+    // tear-downs.
+    debugDefaultTargetPlatformOverride = null;
+  });
+
+  testWidgets('a desktop user bubble is owned by its surface, as before', (
+    tester,
+  ) async {
+    // The contrast row for the mobile one: on desktop the bubble wraps its
+    // markdown in a SanitizingSelectionArea, so the block is a paragraph of that
+    // owner and nothing owns a selection of its own.
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    await _pumpMessages(tester, [
+      _userMessage(
+        'user-1',
+        'prose words here\n\n```dart\nvoid main() {}\n```',
+      ),
+    ]);
+
+    expect(find.byType(SanitizingSelectionArea), findsOneWidget);
+    expect(find.byType(SelectableRegion), findsOneWidget);
+    expect(
+      find.ancestor(
+        of: find.byType(MarkdownWithCodeHighlight),
+        matching: find.byType(SelectableRegion),
+      ),
+      findsOneWidget,
+    );
+
+    debugDefaultTargetPlatformOverride = null;
   });
 }

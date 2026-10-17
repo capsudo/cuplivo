@@ -31,7 +31,6 @@ import 'export_capture_scope.dart';
 import 'mermaid_image_cache.dart';
 import 'diagram_exporter.dart';
 import 'plantuml_block.dart';
-import 'selection_ownership.dart';
 import 'package:path/path.dart' as p;
 import 'package:Cuplivo/l10n/app_localizations.dart';
 import 'package:Cuplivo/theme/app_font_weights.dart';
@@ -48,6 +47,7 @@ import 'markdown_block_list.dart';
 import 'streaming_rich_text.dart';
 import 'markdown_line_lexer.dart';
 import 'markdown_source_scan.dart';
+import 'selection_ownership.dart';
 
 // Inline math is parsed on the UI thread. Bound the lookahead window so a long
 // line with many unmatched openers cannot trigger repeated whole-line scans.
@@ -111,6 +111,25 @@ class MarkdownDetailsExpansion {
   void set(String source, {required bool expanded}) {
     _expanded[source] = expanded;
   }
+}
+
+/// How a code block decides what it shows right now.
+///
+/// A block shows itself whole, or — when the user collapsed it, or the
+/// auto-collapse setting did — only its first lines. A selection over the block
+/// reports whatever it shows, so the walk that maps a copied selection back to
+/// its source has to be told the same facts the rendered widget uses. The manual
+/// toggles are recorded by the blocks themselves (see
+/// `_CollapsibleCodeBlockState.manualExpansionOf`); only the setting travels
+/// here, which is why a walk that knows nothing declares nothing.
+class MarkdownCodeExpansion {
+  const MarkdownCodeExpansion({
+    required this.autoCollapse,
+    required this.collapsedLines,
+  });
+
+  final bool autoCollapse;
+  final int collapsedLines;
 }
 
 /// The component set a markdown surface renders with, in match order.
@@ -306,10 +325,27 @@ class MarkdownWithCodeHighlight extends StatefulWidget {
     final registry = MarkdownDetailsRegistry(
       enableMath: settings.enableMathRendering,
     );
+    // What a code block shows is an input to the walk, exactly like the details
+    // expansion above: a collapsed block reports only its first lines, so the
+    // display space declares those rather than the whole fence.
+    final codeExpansion = MarkdownCodeExpansion(
+      autoCollapse: settings.autoCollapseCodeBlock,
+      collapsedLines: settings.autoCollapseCodeBlockLines,
+    );
     return MarkdownComponent.walkDocument(
       source,
       config: GptMarkdownConfig(
-        components: [DetailsHtmlMd(registry, detailsExpansion), ...set.global],
+        components: [
+          DetailsHtmlMd(registry, detailsExpansion),
+          for (final component in set.global)
+            if (component is FencedCodeBlockMd)
+              FencedCodeBlockMd(
+                streaming: component.streaming,
+                codeExpansion: codeExpansion,
+              )
+            else
+              component,
+        ],
         inlineComponents: set.inline,
         preprocessBlocks: registry.rewrite,
         streaming: streaming,
@@ -2885,14 +2921,19 @@ class _CollapsibleCodeBlockState extends State<_CollapsibleCodeBlock> {
     Widget buildCodeView(String visibleCode) {
       final bool isDesktop =
           Platform.isMacOS || Platform.isWindows || Platform.isLinux;
-      if (_exceedsLineThreshold(visibleCode, 1000)) {
-        return _VirtualizedCodeView(
-          code: visibleCode,
-          language: codeLanguage,
-          theme: codeTheme,
-          textStyle: codeTextStyle,
-          enableHighlight: highlightEnabled,
-          wrap: isDesktop || settings.mobileCodeBlockWrap,
+      if (_CollapsibleCodeBlockState.isLazyCodeBody(visibleCode)) {
+        // The viewport builds only the chunks it shows, so nothing above it can
+        // reach the block's text: it owns its own selection instead, and the
+        // walk declares it a gap (ADR-0010).
+        return _SelfOwnedSelection(
+          child: _VirtualizedCodeView(
+            code: visibleCode,
+            language: codeLanguage,
+            theme: codeTheme,
+            textStyle: codeTextStyle,
+            enableHighlight: highlightEnabled,
+            wrap: isDesktop || settings.mobileCodeBlockWrap,
+          ),
         );
       }
       final codeView = SelectableHighlightView(
@@ -3057,12 +3098,12 @@ class _CollapsibleCodeBlockState extends State<_CollapsibleCodeBlock> {
   bool _hasCollapsedHiddenLines(SettingsProvider settings) {
     return _exceedsLineThreshold(
       widget.code,
-      _collapsedVisibleLineCount(settings),
+      _collapsedVisibleLineCount(settings.autoCollapseCodeBlockLines),
     );
   }
 
-  int _collapsedVisibleLineCount(SettingsProvider settings) {
-    return settings.autoCollapseCodeBlockLines.clamp(1, 999999);
+  static int _collapsedVisibleLineCount(int configuredLines) {
+    return configuredLines.clamp(1, 999999);
   }
 
   bool _isEffectivelyExpanded(SettingsProvider settings) {
@@ -3178,14 +3219,51 @@ class _CollapsibleCodeBlockState extends State<_CollapsibleCodeBlock> {
     }
   }
 
-  String _collapsedHighlightedCode(SettingsProvider settings) {
-    final visibleLines = _collapsedVisibleLineCount(settings);
-    final trimmed = _trimTrailingNewlines(widget.code);
+  String _collapsedHighlightedCode(SettingsProvider settings) => collapsedCode(
+    widget.code,
+    _collapsedVisibleLineCount(settings.autoCollapseCodeBlockLines),
+  );
+
+  /// The manual toggle recorded for [stateKey], or null when the block has
+  /// never been toggled — the copy walk reads this back.
+  static bool? manualExpansionOf(String stateKey) =>
+      _manualExpansionByCodeKey[stateKey];
+
+  /// The first [visibleLines] lines of [code], which is what a collapsed block
+  /// shows.
+  static String collapsedCode(String code, int visibleLines) {
+    final trimmed = _trimTrailingNewlines(code);
     if (trimmed.isEmpty) return trimmed;
     return trimmed.split(RegExp(r'\r\n|\r|\n')).take(visibleLines).join('\n');
   }
 
-  bool _exceedsLineThreshold(String code, int threshold) {
+  /// The code a block for [language]/[code] shows right now, or — put the other
+  /// way — the text a selection over that block reports.
+  static String shownCode({
+    required String language,
+    required String code,
+    required bool autoCollapse,
+    required int collapsedLines,
+  }) {
+    final manual = manualExpansionOf(_codeBlockStateKey(language, code));
+    final expanded =
+        manual ??
+        !(autoCollapse && _exceedsLineThreshold(code, collapsedLines));
+    if (expanded) return _trimTrailingNewlines(code);
+    return collapsedCode(code, _collapsedVisibleLineCount(collapsedLines));
+  }
+
+  /// The line count past which a body stops being one text and becomes the
+  /// chunk viewport, whose text nothing above it can reach (ADR-0010).
+  static const int lazyCodeViewLineThreshold = 1000;
+
+  /// Whether [code] renders as the lazy chunk viewport rather than as one text.
+  /// The renderer and the walk both decide with this, so the display space can
+  /// never declare a body the viewport does not show.
+  static bool isLazyCodeBody(String code) =>
+      _exceedsLineThreshold(code, lazyCodeViewLineThreshold);
+
+  static bool _exceedsLineThreshold(String code, int threshold) {
     if (threshold < 1) return true;
     final end = _trimTrailingNewlinesEndIndex(code);
     if (end <= 0) return false;
@@ -3218,7 +3296,7 @@ class _CollapsibleCodeBlockState extends State<_CollapsibleCodeBlock> {
             MarkdownWithCodeHighlight._streamingHighlightMaxChars;
   }
 
-  int _trimTrailingNewlinesEndIndex(String s) {
+  static int _trimTrailingNewlinesEndIndex(String s) {
     int end = s.length;
     while (end > 0) {
       final ch = s.codeUnitAt(end - 1);
@@ -3232,7 +3310,7 @@ class _CollapsibleCodeBlockState extends State<_CollapsibleCodeBlock> {
   }
 
   // Remove trailing newlines to avoid rendering an extra empty line at the bottom
-  String _trimTrailingNewlines(String s) {
+  static String _trimTrailingNewlines(String s) {
     if (s.isEmpty) return s;
     final end = _trimTrailingNewlinesEndIndex(s);
     return end == s.length ? s : s.substring(0, end);
@@ -3716,7 +3794,6 @@ class _MarkdownTableBlockState extends State<_MarkdownTableBlock> {
           context,
           borderColor: borderColor,
           headerBg: headerBg,
-          compact: useCompactTable,
           columnWidth: columnWidth,
           fixedColumns: shouldScrollHorizontally,
           rowCount: isExporting
@@ -3746,35 +3823,42 @@ class _MarkdownTableBlockState extends State<_MarkdownTableBlock> {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 tableSurface,
-                if (!isExporting) _buildRowPager(context),
+                // The row pager is chrome, not text, on this layout too: a
+                // copy that spans the table must not pick up a button label
+                // (ADR-0010 decision 6).
+                if (!isExporting)
+                  SelectionContainer.disabled(child: _buildRowPager(context)),
               ],
             ),
           );
         }
 
         final l10n = AppLocalizations.of(context)!;
-        return SelectionContainer.disabled(
-          child: Container(
-            key: const ValueKey('markdown-table-block'),
-            width: double.infinity,
-            margin: const EdgeInsets.symmetric(vertical: 6),
-            decoration: BoxDecoration(
-              color: Color.alphaBlend(
-                cs.primary.withValues(alpha: isDark ? 0.045 : 0.018),
-                cs.surface,
-              ).withValues(alpha: kBlockFillAlphaTable),
-              borderRadius: BorderRadius.circular(12),
-            ),
-            foregroundDecoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: borderColor, width: 0.8),
-            ),
-            clipBehavior: Clip.antiAlias,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                _MarkdownTableToolbar(
+        return Container(
+          key: const ValueKey('markdown-table-block'),
+          width: double.infinity,
+          margin: const EdgeInsets.symmetric(vertical: 6),
+          decoration: BoxDecoration(
+            color: Color.alphaBlend(
+              cs.primary.withValues(alpha: isDark ? 0.045 : 0.018),
+              cs.surface,
+            ).withValues(alpha: kBlockFillAlphaTable),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          foregroundDecoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: borderColor, width: 0.8),
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              // The toolbar and the row pager are chrome, not text: they stay
+              // out of the selection so a copied selection cannot pick up a
+              // button label. The body is a paragraph of the surface's owner.
+              SelectionContainer.disabled(
+                child: _MarkdownTableToolbar(
                   label: l10n.markdownTableLabel,
                   backgroundColor: headerBg,
                   copyLabel: l10n.shareProviderSheetCopyButton,
@@ -3790,17 +3874,18 @@ class _MarkdownTableBlockState extends State<_MarkdownTableBlock> {
                       ? _exportImage(context)
                       : _saveImageToGallery(context),
                 ),
-                GestureDetector(
-                  key: const ValueKey('markdown-table-body'),
-                  behavior: HitTestBehavior.opaque,
-                  child: _buildMobileTableViewport(
-                    scrollable: shouldScrollHorizontally,
-                    child: tableSurface,
-                  ),
+              ),
+              GestureDetector(
+                key: const ValueKey('markdown-table-body'),
+                behavior: HitTestBehavior.opaque,
+                child: _buildMobileTableViewport(
+                  scrollable: shouldScrollHorizontally,
+                  child: tableSurface,
                 ),
-                if (!isExporting) _buildRowPager(context),
-              ],
-            ),
+              ),
+              if (!isExporting)
+                SelectionContainer.disabled(child: _buildRowPager(context)),
+            ],
           ),
         );
       },
@@ -3811,7 +3896,6 @@ class _MarkdownTableBlockState extends State<_MarkdownTableBlock> {
     BuildContext context, {
     required Color borderColor,
     required Color headerBg,
-    required bool compact,
     required double columnWidth,
     required bool fixedColumns,
     required int rowCount,
@@ -3845,7 +3929,6 @@ class _MarkdownTableBlockState extends State<_MarkdownTableBlock> {
                   style: style,
                   config: config,
                   appFontFamily: appFontFamily,
-                  selectable: !compact,
                 ),
             ],
           ),
@@ -4185,7 +4268,6 @@ class _MarkdownTableCell extends StatelessWidget {
     required this.style,
     required this.config,
     required this.appFontFamily,
-    required this.selectable,
   });
 
   final _MarkdownTableCellData data;
@@ -4193,7 +4275,6 @@ class _MarkdownTableCell extends StatelessWidget {
   final TextStyle style;
   final GptMarkdownConfig config;
   final String? appFontFamily;
-  final bool selectable;
 
   @override
   Widget build(BuildContext context) {
@@ -4216,30 +4297,19 @@ class _MarkdownTableCell extends StatelessWidget {
     );
     final textSpan = TextSpan(style: baseStyle, children: spans);
 
+    // A cell is a paragraph of the surface's selection owner — one owner per
+    // surface, never a cell's own. Joining it is what keeps a widget-backed run
+    // in the cell (an inline code chip, a citation, an inline formula, a link)
+    // as *declared text*: the cell's own `SelectableText` instead baked every
+    // such run into a single U+FFFC in its edit value, so copying a cell put
+    // that placeholder character on the clipboard and the run had no interior
+    // position to select into. Every markdown surface provides the owner; a
+    // table rendered without one is not selectable, like any other bare text.
+    final Widget content = Text.rich(textSpan, textAlign: data.alignment);
+
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
-      child: Align(
-        alignment: _alignmentFor(data.alignment),
-        child: selectable
-            ? SelectableText.rich(
-                textSpan,
-                textAlign: data.alignment,
-                // A cell owns its selection (it is a nested EditableText), so
-                // the selection area above is told it lost this one.
-                onSelectionChanged: (selection, _) {
-                  if (!selection.isCollapsed) {
-                    reportNestedSelectionClaimed(context);
-                  }
-                },
-              )
-            : RichText(
-                text: textSpan,
-                textAlign: data.alignment,
-                softWrap: true,
-                overflow: TextOverflow.visible,
-                textWidthBasis: TextWidthBasis.parent,
-              ),
-      ),
+      child: Align(alignment: _alignmentFor(data.alignment), child: content),
     );
   }
 
@@ -4830,7 +4900,10 @@ class _DiagramBlockState extends State<_DiagramBlock> {
             controller: _vMermaidScrollController,
             child: SingleChildScrollView(
               scrollDirection: Axis.horizontal,
-              child: codeView,
+              // The surface owner cannot reach the diagram's text: the preview is
+              // a bitmap, and this view owns its own selection and reports the
+              // claim, like the PlantUML code tab (ADR-0010).
+              child: _SelfOwnedSelection(child: codeView),
             ),
           ),
         ),
@@ -5331,28 +5404,30 @@ class _MermaidLoadingViewState extends State<_MermaidLoadingView>
   @override
   Widget build(BuildContext context) {
     final l10n = AppLocalizations.of(context)!;
-    return Center(
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          RotationTransition(
-            turns: _controller,
-            child: Icon(
-              Lucide.Loader,
-              size: 24,
-              color: widget.colors.textSecondary,
+    return SelectionContainer.disabled(
+      child: Center(
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            RotationTransition(
+              turns: _controller,
+              child: Icon(
+                Lucide.Loader,
+                size: 24,
+                color: widget.colors.textSecondary,
+              ),
             ),
-          ),
-          const SizedBox(width: 8),
-          Text(
-            l10n.mermaidGeneratingImage,
-            style: TextStyle(
-              fontSize: 14,
-              height: 1.3,
-              color: widget.colors.textSecondary,
+            const SizedBox(width: 8),
+            Text(
+              l10n.mermaidGeneratingImage,
+              style: TextStyle(
+                fontSize: 14,
+                height: 1.3,
+                color: widget.colors.textSecondary,
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -5366,22 +5441,24 @@ class _MermaidErrorView extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final l10n = AppLocalizations.of(context)!;
-    return Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(Lucide.ImageOff, size: 48, color: colors.textTertiary),
-          const SizedBox(height: 8),
-          Text(
-            l10n.mermaidGenerationFailedHint,
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              fontSize: 14,
-              height: 1.35,
-              color: colors.textTertiary,
+    return SelectionContainer.disabled(
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Lucide.ImageOff, size: 48, color: colors.textTertiary),
+            const SizedBox(height: 8),
+            Text(
+              l10n.mermaidGenerationFailedHint,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: 14,
+                height: 1.35,
+                color: colors.textTertiary,
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -5418,9 +5495,13 @@ class SoftHrLine extends BlockMd {
 
 // Robust fenced code block that takes precedence over other blocks
 class FencedCodeBlockMd extends BlockMd {
-  FencedCodeBlockMd({required this.streaming});
+  FencedCodeBlockMd({required this.streaming, this.codeExpansion});
 
   final bool streaming;
+
+  /// The collapse facts of the walk this component belongs to, or null when the
+  /// walk maps no selections (only the copy walk needs them).
+  final MarkdownCodeExpansion? codeExpansion;
 
   @override
   RegExp get exp => RegExp(expString, dotAll: true, multiLine: true);
@@ -5448,12 +5529,58 @@ class FencedCodeBlockMd extends BlockMd {
   }
 
   @override
-  MdNode node(MdNodeContext ctx, String text) =>
-      // The code body is selectable only within the code view's own selection
-      // area, so it contributes no text to the surrounding document. The whole
-      // fence rides along when a selection spans it.
-      MdNode.gap(MdNodeKind.codeBlock, ctx.rangeOf(text));
+  MdNode node(MdNodeContext ctx, String text) {
+    final expansion = codeExpansion;
+    final m = exp.firstMatch(text);
+    final lang = m == null ? '' : (m.group(3) ?? '').trim();
+    final code = m == null
+        ? ''
+        : _unmaskHtmlTagStartsInsideFencedCode(m.group(4) ?? m.group(5) ?? '');
+    if (isDiagramFence(lang, code)) {
+      // A diagram shows a bitmap, or a code view that owns its own selection, so
+      // the surface's owner never reaches the diagram's text: the fence occupies
+      // no display space and re-emits whole when a selection spans it.
+      return MdNode.gap(MdNodeKind.codeBlock, ctx.rangeOf(text));
+    }
+    if (expansion == null || m == null) {
+      // A walk without the collapse facts cannot know what the block shows, so
+      // the whole fence rides along the way it always did.
+      return MdNode.gap(MdNodeKind.codeBlock, ctx.rangeOf(text));
+    }
+    final shown = _CollapsibleCodeBlockState.shownCode(
+      language: lang,
+      code: code,
+      autoCollapse: expansion.autoCollapse,
+      collapsedLines: expansion.collapsedLines,
+    );
+    if (_CollapsibleCodeBlockState.isLazyCodeBody(shown)) {
+      // Past the threshold the body is a chunk viewport that only builds the
+      // chunks it shows, so the surface's owner never reaches the whole text:
+      // the block owns its own selection, and the fence re-emits whole when a
+      // selection spans it (ADR-0010).
+      return MdNode.gap(MdNodeKind.codeBlock, ctx.rangeOf(text));
+    }
+    // The body is a paragraph of the surface's selection owner, so a selection
+    // over the block reports the code it shows: the display space declares
+    // exactly that, and the fence still re-emits whole, because its backticks
+    // live outside the body.
+    return MdNode.opaque(MdNodeKind.codeBlock, ctx.rangeOf(text), shown);
+  }
 }
+
+/// A mermaid fence, or any fence whose body is an SVG document.
+bool isMermaidOrSvgFence(String language, String code) =>
+    language.toLowerCase() == 'mermaid' || isSvgCodeBlock(language, code);
+
+/// Whether a fence renders as a diagram block rather than as code: mermaid, an
+/// SVG document, or PlantUML.
+///
+/// A diagram's text is never reachable from the surface's selection owner — its
+/// preview is a bitmap and its code view owns its own selection — so it
+/// contributes no display space. The renderer routes on this predicate and the
+/// walk reads it, so the two cannot drift (ADR-0010).
+bool isDiagramFence(String language, String code) =>
+    isMermaidOrSvgFence(language, code) || language.toLowerCase() == 'plantuml';
 
 Widget _buildFencedContent(
   String lang,
@@ -5461,22 +5588,24 @@ Widget _buildFencedContent(
   bool isStreamingFence,
   bool closed,
 ) {
-  final langLower = lang.toLowerCase();
-  if (langLower == 'mermaid' || isSvgCodeBlock(lang, code)) {
+  // The routing gate and the walk's gate are one predicate, so a fence cannot
+  // render as a diagram while the display space declares its code.
+  if (!isDiagramFence(lang, code)) {
+    return _CollapsibleCodeBlock(
+      language: lang,
+      code: code,
+      streaming: isStreamingFence,
+      closed: closed,
+    );
+  }
+  if (isMermaidOrSvgFence(lang, code)) {
     return _DiagramBlock(
       code: code,
       streaming: isStreamingFence,
-      isSvg: langLower != 'mermaid',
+      isSvg: lang.toLowerCase() != 'mermaid',
     );
-  } else if (langLower == 'plantuml') {
-    return PlantUMLBlock(code: code);
   }
-  return _CollapsibleCodeBlock(
-    language: lang,
-    code: code,
-    streaming: isStreamingFence,
-    closed: closed,
-  );
+  return PlantUMLBlock(code: code);
 }
 
 /// Scrollable LaTeX block to prevent overflow when equations are very wide
@@ -6186,11 +6315,40 @@ class EscapeAwareTableMd extends TableMd {
   }
 
   @override
-  MdNode node(MdNodeContext ctx, String text) =>
-      // A table owns its selection: its cells are reached through the table's
-      // own area, never through the text around it (measured on every
-      // platform). The whole table rides along when a selection spans it.
-      MdNode.gap(MdNodeKind.table, ctx.rangeOf(text));
+  MdNode node(MdNodeContext ctx, String text) {
+    // A cell is a paragraph of the enclosing selection owner, so a selection
+    // over the table reports the cells' own text — the display space has to
+    // declare exactly that, or a selection spanning the table cannot be mapped
+    // back to its source at all (it silently fell back to plain text). The
+    // table still re-emits whole: its pipes live between the cells, so no
+    // single cell's source can stand in for the table.
+    final lines = text
+        .trim()
+        .split('\n')
+        .where((line) => line.trim().isNotEmpty)
+        .toList();
+    final hasHeader = lines.length >= 2;
+    final display = StringBuffer();
+    for (var index = 0; index < lines.length; index++) {
+      // The divider row is the table's header separator, not a row of cells.
+      if (hasHeader && index == 1) continue;
+      for (final cell in _splitMarkdownTableLine(lines[index].trim())) {
+        display.write(
+          mdDisplayOf(
+            ctx.walk(
+              cell.trim().replaceAll(_codeDollarMask, r'$'),
+              includeGlobal: true,
+            ),
+          ),
+        );
+      }
+    }
+    return MdNode.opaque(
+      MdNodeKind.table,
+      ctx.rangeOf(text),
+      display.toString(),
+    );
+  }
 }
 
 // Prevent link regex from spanning across lines (dotAll=true in engine).
@@ -6619,22 +6777,16 @@ class SelectableHighlightView extends StatefulWidget {
 }
 
 class _SelectableHighlightViewState extends State<SelectableHighlightView> {
-  static const MethodChannel _iosTranslationChannel = MethodChannel(
-    'app.ios_translation',
-  );
-
   late List<TextSpan> _codeTextSpans;
-  bool _iosTranslationAvailable = false;
-  Widget? _selectable;
-  String _selectedCode = '';
+
+  /// The built view, kept until the source, theme or highlight flag changes:
+  /// shaping a long code block is the expensive part of this widget.
+  Widget? _view;
 
   @override
   void initState() {
     super.initState();
     _codeTextSpans = _highlightSource();
-    if (defaultTargetPlatform == TargetPlatform.iOS) {
-      unawaited(_loadIosTranslationAvailability());
-    }
   }
 
   @override
@@ -6648,7 +6800,7 @@ class _SelectableHighlightViewState extends State<SelectableHighlightView> {
       return;
     }
     _codeTextSpans = _highlightSource();
-    _selectable = null;
+    _view = null;
   }
 
   List<TextSpan> _highlightSource() {
@@ -6666,75 +6818,6 @@ class _SelectableHighlightViewState extends State<SelectableHighlightView> {
       return _convertNodes(nodes);
     } catch (_) {
       return const [];
-    }
-  }
-
-  Future<void> _loadIosTranslationAvailability() async {
-    try {
-      final available =
-          await _iosTranslationChannel.invokeMethod<bool>('isAvailable') ??
-          false;
-      if (mounted && available != _iosTranslationAvailable) {
-        setState(() => _iosTranslationAvailable = available);
-      }
-    } on MissingPluginException {
-      // Keep the stock selection menu when the native bridge is unavailable.
-    } on PlatformException {
-      // Keep the stock selection menu when the availability check fails.
-    }
-  }
-
-  Widget _buildSelectionContextMenu(
-    BuildContext context,
-    EditableTextState editableTextState,
-  ) {
-    final value = editableTextState.textEditingValue;
-    final selection = value.selection;
-    if (!_iosTranslationAvailable ||
-        !selection.isValid ||
-        selection.isCollapsed) {
-      return AdaptiveTextSelectionToolbar.editableText(
-        editableTextState: editableTextState,
-      );
-    }
-
-    final selectedText = selection.textInside(value.text);
-    if (selectedText.trim().isEmpty) {
-      return AdaptiveTextSelectionToolbar.editableText(
-        editableTextState: editableTextState,
-      );
-    }
-
-    final anchors = editableTextState.contextMenuAnchors;
-    final buttonItems = <ContextMenuButtonItem>[
-      ...editableTextState.contextMenuButtonItems,
-      ContextMenuButtonItem(
-        label: AppLocalizations.of(context)!.chatMessageWidgetTranslateTooltip,
-        onPressed: () {
-          editableTextState.hideToolbar();
-          unawaited(
-            _presentIosTranslation(selectedText, anchors.primaryAnchor),
-          );
-        },
-      ),
-    ];
-    return AdaptiveTextSelectionToolbar.buttonItems(
-      anchors: anchors,
-      buttonItems: buttonItems,
-    );
-  }
-
-  Future<void> _presentIosTranslation(String text, Offset anchor) async {
-    try {
-      await _iosTranslationChannel.invokeMethod<void>('present', {
-        'text': text,
-        'anchorX': anchor.dx,
-        'anchorY': anchor.dy,
-      });
-    } on MissingPluginException {
-      // The toolbar has already closed; there is no native UI to present.
-    } on PlatformException {
-      // Do not let a native presentation failure affect text selection.
     }
   }
 
@@ -6770,56 +6853,50 @@ class _SelectableHighlightViewState extends State<SelectableHighlightView> {
           ? [TextSpan(text: widget.source)]
           : _codeTextSpans,
     );
-    return _selectable ??= widget.source.length > 2048
-        ? SelectionArea(
-            onSelectionChanged: (selection) {
-              _selectedCode = selection?.plainText ?? '';
-              if (_selectedCode.isNotEmpty) {
-                reportNestedSelectionClaimed(context);
-              }
-            },
-            contextMenuBuilder: _buildChunkSelectionContextMenu,
-            // SelectableText reserves its 2px cursor plus RenderEditable's 1px
-            // caret gap, even when read-only. Keep the same wrapping and width.
-            child: Padding(
-              padding: const EdgeInsets.only(right: 3),
-              child: StreamingRichText(text: Text.rich(span)),
-            ),
-          )
-        : SelectableText.rich(
-            span,
-            contextMenuBuilder: _buildSelectionContextMenu,
-            onSelectionChanged: (selection, _) {
-              if (!selection.isCollapsed) {
-                reportNestedSelectionClaimed(context);
-              }
-            },
-          );
+    // The code is a paragraph of the surface's selection owner, not a view that
+    // owns a selection: one drag crosses the block, and what the selection
+    // reports is the code the block shows. Past the threshold the shaping is
+    // windowed for cost, which is a layout choice, not a selection one.
+    //
+    // A surface that provides no owner at all - a mobile user bubble, whose
+    // long-press belongs to the message menu - has nothing to register with, so
+    // the block owns its selection there instead (ADR-0010).
+    final content = widget.source.length > 2048
+        ? StreamingRichText(text: Text.rich(span))
+        : Text.rich(span);
+    return _view ??= _ownedWhenUnreached(context, content);
   }
+}
 
-  Widget _buildChunkSelectionContextMenu(
-    BuildContext context,
-    SelectableRegionState region,
-  ) {
-    final anchors = region.contextMenuAnchors;
-    final selectedText = _selectedCode;
-    return AdaptiveTextSelectionToolbar.buttonItems(
-      anchors: anchors,
-      buttonItems: [
-        ...region.contextMenuButtonItems,
-        if (_iosTranslationAvailable && selectedText.trim().isNotEmpty)
-          ContextMenuButtonItem(
-            label: AppLocalizations.of(
-              context,
-            )!.chatMessageWidgetTranslateTooltip,
-            onPressed: () {
-              region.hideToolbar();
-              unawaited(
-                _presentIosTranslation(selectedText, anchors.primaryAnchor),
-              );
-            },
-          ),
-      ],
+/// A block the enclosing selection owner cannot reach as text owns its own
+/// selection and reports the claim (ADR-0009 decision 5). A markdown surface
+/// normally provides the owner; this is the fallback for one that deliberately
+/// does not (ADR-0010).
+Widget _ownedWhenUnreached(BuildContext context, Widget child) =>
+    SelectionContainer.maybeOf(context) == null
+    ? _SelfOwnedSelection(child: child)
+    : child;
+
+/// A block's own [SelectionArea], which is what makes a block selectable when
+/// the enclosing owner cannot reach its text at all: a surface that provides no
+/// owner, and the lazy chunk viewport, which only builds the chunks it shows.
+/// Reporting the claim is what stands an outer area's copy override down: while
+/// it is registered the framework's own copy actions forward to it, so without
+/// the report it would answer a copy inside this block with its own stale text.
+class _SelfOwnedSelection extends StatelessWidget {
+  const _SelfOwnedSelection({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return SelectionArea(
+      onSelectionChanged: (content) {
+        if ((content?.plainText ?? '').isNotEmpty) {
+          reportNestedSelectionClaimed(context);
+        }
+      },
+      child: child,
     );
   }
 }

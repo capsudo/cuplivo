@@ -1,8 +1,11 @@
+import 'dart:convert';
+
 import 'package:Cuplivo/core/providers/settings_provider.dart';
 import 'package:Cuplivo/l10n/app_localizations.dart';
 import 'package:Cuplivo/shared/widgets/markdown_block_list.dart';
 import 'package:Cuplivo/shared/widgets/markdown_line_lexer.dart';
 import 'package:Cuplivo/shared/widgets/markdown_with_highlight.dart';
+import 'package:Cuplivo/shared/widgets/mermaid_image_cache.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:gpt_markdown/custom_widgets/markdown_config.dart';
@@ -41,7 +44,20 @@ final class _DriftFixture {
   final bool streaming;
 }
 
-const List<_DriftFixture> _fixtures = [
+/// A fence body past the lazy threshold: the block renders as a chunk viewport
+/// that only builds the chunks it shows, so no owner above it can reach the
+/// whole text (ADR-0010).
+final String _lazyFenceBody = List<String>.generate(
+  1050,
+  (index) => 'line$index',
+).join('\n');
+
+/// A 1x1 transparent PNG, what the diagram override hands back.
+const _transparentPngBase64 =
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwAD'
+    'hgGAWjR9awAAAABJRU5ErkJggg==';
+
+final List<_DriftFixture> _fixtures = [
   _DriftFixture(
     'emphasis, inline code and paragraphs',
     '**Bold**, and *italic* with `code`.\n\nSecond paragraph.',
@@ -81,6 +97,19 @@ const List<_DriftFixture> _fixtures = [
     '```text\nprice \$5 and <b>bold</b>',
     streaming: true,
   ),
+  _DriftFixture(
+    'mermaid fence',
+    'before\n\n```mermaid\ngraph TD;\nA-->B;\n```\n\nafter',
+  ),
+  _DriftFixture(
+    'svg fence',
+    'before\n\n```svg\n<svg viewBox="0 0 20 20"><circle r="5" /></svg>\n```\n'
+        '\nafter',
+  ),
+  _DriftFixture(
+    'fence body past the lazy threshold',
+    'intro\n\n```text\n$_lazyFenceBody\n```\n\noutro',
+  ),
   _DriftFixture('link label', '[label](https://example.com) tail'),
   _DriftFixture(
     'details block',
@@ -103,6 +132,12 @@ const List<_DriftFixture> _fixtures = [
     // A table contributes nothing to the surrounding copy on any platform, so
     // whether its cells split on the escaped pipe never reaches this mapping.
     '| cell \\| pipe | plain |\n| --- | --- |\n| x | y |',
+  ),
+  _DriftFixture(
+    'table cell holding a details tag',
+    // The tag is not an inline component, so the cell renders it as literal
+    // text; the walk has to declare exactly that and nothing more.
+    '| <details><summary>s</summary>b</details> | y |\n| --- | --- |\n| x | z |',
   ),
   _DriftFixture('strikethrough', '~~strike~~'),
   _DriftFixture('underline tag', '<u>under</u>'),
@@ -215,8 +250,14 @@ Future<String> _copiedText(
     await tester.tap(find.text(expand).first);
     await tester.pumpAndSettle();
   }
+  // The surface owner's own region, not one a block carries for itself: a chunk
+  // viewport past the threshold owns a region of its own, and this check is
+  // about what the surface copies.
   final region = tester.state<SelectableRegionState>(
-    find.byType(SelectableRegion),
+    find.ancestor(
+      of: find.byType(MarkdownWithCodeHighlight),
+      matching: find.byType(SelectableRegion),
+    ),
   );
   region.selectAll(SelectionChangedCause.keyboard);
   await tester.pumpAndSettle();
@@ -277,6 +318,20 @@ Future<void> _expectDisplaySpaceMatchesCopy(
 }
 
 void main() {
+  // A diagram's preview is a bitmap in the shipped app, and the override is how
+  // the tests take that path instead of the webview one: the block still shows
+  // its bitmap, so the equality below is about the display space and not about
+  // a renderer that never ran.
+  setUp(() {
+    MermaidImageCache.clear();
+    debugMermaidBitmapRenderOverride = (code, isDark, themeVars) async =>
+        MermaidBitmapRenderResult.success(base64Decode(_transparentPngBase64));
+  });
+  tearDown(() {
+    debugMermaidBitmapRenderOverride = null;
+    MermaidImageCache.clear();
+  });
+
   for (final fixture in _fixtures) {
     testWidgets(fixture.name, (tester) async {
       await _expectDisplaySpaceMatchesCopy(
@@ -288,6 +343,55 @@ void main() {
       );
     });
   }
+
+  testWidgets('a fence past the lazy threshold is a gap, not display text', (
+    tester,
+  ) async {
+    final source = 'intro\n\n```text\n$_lazyFenceBody\n```\n\noutro';
+    final document = MarkdownWithCodeHighlight.markdownDocument(
+      source,
+      settings: SettingsProvider(createBusinessTestPreferences()),
+      streaming: false,
+    );
+    // The viewport only builds the chunks it shows, so its body is not display
+    // text at all: the prose around it is what a selection over the block
+    // reports, and no line of the body can be mapped.
+    expect(document.displayText, isNot(contains('line1')));
+    expect(document.displayText, contains('intro'));
+    expect(document.displayText, contains('outro'));
+    expect(document.emitSelectionMarkdown('line1'), isNull);
+    // A selection that spans the block still re-emits it whole, backticks and
+    // all: the gap is what carries the fence back.
+    expect(document.emitSelectionMarkdown(document.displayText), source);
+  });
+
+  testWidgets('a diagram fence is a gap, not display text', (tester) async {
+    // The preview is a bitmap and the code view owns its own selection, so the
+    // surface's owner never reaches the diagram's text — whichever diagram the
+    // fence holds. No line of it is display text, and a selection that spans the
+    // block re-emits the fence whole.
+    for (final (language, body, line) in const [
+      ('mermaid', 'graph TD;\nA-->B;', 'A-->B'),
+      ('svg', '<svg viewBox="0 0 20 20"><circle r="5" /></svg>', 'circle'),
+      ('plantuml', '@startuml\nA -> B\n@enduml', 'A -> B'),
+    ]) {
+      final source = 'before\n\n```$language\n$body\n```\n\nafter';
+      final document = MarkdownWithCodeHighlight.markdownDocument(
+        source,
+        settings: SettingsProvider(createBusinessTestPreferences()),
+        streaming: false,
+      );
+      expect(document.displayText, isNot(contains(line)), reason: language);
+      expect(document.displayText, contains('before'), reason: language);
+      expect(document.displayText, contains('after'), reason: language);
+      expect(document.emitSelectionMarkdown(line), isNull, reason: language);
+      expect(
+        document.emitSelectionMarkdown(document.displayText),
+        source,
+        reason: language,
+      );
+    }
+  });
 
   testWidgets('details block collapsed again after being read', (tester) async {
     const source = '<details><summary>More</summary>hidden body</details>';

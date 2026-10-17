@@ -123,6 +123,42 @@ RenderParagraph _paragraphContaining(String text) {
       .firstWhere((paragraph) => paragraph.text.toPlainText().contains(text));
 }
 
+/// The span a code block renders.
+///
+/// The view is a paragraph of the surface's selection owner now, so the widget
+/// that carries the code is a `Text`, not a `SelectableText`.
+TextSpan _codeSpan(WidgetTester tester, Finder view) {
+  final finder = find.descendant(of: view, matching: find.byType(Text)).first;
+  // The view always hands `Text.rich` a `TextSpan`: it builds one.
+  return tester.widget<Text>(finder).textSpan! as TextSpan;
+}
+
+/// The plain text of every code block under [view].
+String _codeText(WidgetTester tester, Finder view) => tester
+    .widgetList<Text>(find.descendant(of: view, matching: find.byType(Text)))
+    .map((widget) => widget.textSpan?.toPlainText() ?? widget.data ?? '')
+    .join('\n');
+
+/// The colour the first text run of [paragraph] ends up with.
+///
+/// `Text.rich` puts the ambient style on the root span and the caller's span
+/// underneath it, so reading the root alone answers a different question than
+/// "what colour is this text".
+Color? _inkOf(RenderParagraph paragraph) {
+  Color? walk(InlineSpan span, Color? inherited) {
+    final color = span.style?.color ?? inherited;
+    if (span is TextSpan && (span.text?.isNotEmpty ?? false)) return color;
+    Color? found;
+    span.visitChildren((child) {
+      found ??= walk(child, color);
+      return found == null;
+    });
+    return found;
+  }
+
+  return walk(paragraph.text, null);
+}
+
 const _transparentPngDataUrl =
     'data:image/png;base64,'
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwAD'
@@ -361,6 +397,54 @@ Widget _markdownHarness(
 void _overrideMarkdownTablePlatform(TargetPlatform platform) {
   markdownTableTargetPlatformOverride = platform;
   addTearDown(() => markdownTableTargetPlatformOverride = null);
+}
+
+/// Records what reaches the clipboard.
+class _ClipboardText {
+  String? value;
+
+  void install(WidgetTester tester) {
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(SystemChannels.platform, (call) async {
+      if (call.method == 'Clipboard.setData') {
+        final data = Map<String, dynamic>.from(call.arguments as Map);
+        value = data['text'] as String?;
+      }
+      return null;
+    });
+    addTearDown(() {
+      messenger.setMockMethodCallHandler(SystemChannels.platform, null);
+    });
+  }
+}
+
+/// The Copy item of the innermost [SelectionArea] around [region], built the way
+/// the framework builds the toolbar for a selection — which is also the path a
+/// surface with no `SanitizingSelectionArea` copies through.
+ContextMenuButtonItem _toolbarCopyItem(
+  WidgetTester tester,
+  SelectableRegionState region,
+) {
+  final areaFinder = find.byType(SelectionArea).first;
+  final area = tester.widget<SelectionArea>(areaFinder);
+  final menu =
+      area.contextMenuBuilder!(tester.element(areaFinder), region)
+          as AdaptiveTextSelectionToolbar;
+  return menu.buttonItems!.singleWhere(
+    (item) => item.type == ContextMenuButtonType.copy,
+  );
+}
+
+/// Selects everything [region] reaches and copies it through the toolbar.
+Future<void> _copyAllThroughToolbar(
+  WidgetTester tester,
+  SelectableRegionState region,
+) async {
+  region.selectAll(SelectionChangedCause.keyboard);
+  await tester.pump();
+  _toolbarCopyItem(tester, region).onPressed!();
+  await tester.pump();
 }
 
 Widget _streamingMarkdownHarness(
@@ -1808,6 +1892,127 @@ ${rows.join('\n')}
     expect(find.textContaining('line9999'), findsNothing);
   });
 
+  group('a markdown surface that provides no selection owner', () {
+    // The case is a mobile user bubble: its markdown is rendered without a
+    // `SanitizingSelectionArea`, because a `SelectionArea` over the whole bubble
+    // would take the long-press that opens the message menu. A block whose text
+    // nothing above it can reach owns its own selection instead (ADR-0010) —
+    // without that, a fenced code block in a sent message is not selectable at
+    // all, which is what master did through the block's own `SelectableText`.
+    testWidgets('still lets its code block be selected and copied', (
+      tester,
+    ) async {
+      final clipboard = _ClipboardText()..install(tester);
+      await tester.pumpWidget(_markdownHarness('```dart\nvoid main() {}\n```'));
+      await tester.pumpAndSettle();
+
+      // The block owns the only region there is.
+      expect(find.byType(SelectableRegion), findsOneWidget);
+      await _copyAllThroughToolbar(
+        tester,
+        tester.state<SelectableRegionState>(find.byType(SelectableRegion)),
+      );
+
+      expect(clipboard.value, contains('void main() {}'));
+    });
+
+    testWidgets('leaves a compact table scrolling instead of selecting', (
+      tester,
+    ) async {
+      // The other half of the same decision. A compact table is horizontally
+      // scrollable, and a selection area over it would take the drag that
+      // scrolls it — the cost ADR-0010 records for the owned case, which must
+      // not be paid here, where no surface owner exists at all. Its cells were
+      // not selectable in this shape before this branch either (they sat in
+      // `SelectionContainer.disabled` on mobile), so nothing is lost.
+      _overrideMarkdownTablePlatform(TargetPlatform.iOS);
+      await tester.pumpWidget(
+        _markdownHarness(
+          '| A | B | C | D | E |\n| --- | --- | --- | --- | --- |\n| apple |',
+          width: 320,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final viewport = find.byKey(
+        const ValueKey('markdown-table-horizontal-scroll'),
+      );
+      final scroll = find.descendant(
+        of: viewport,
+        matching: find.byType(Scrollable),
+      );
+      final state = tester.state<ScrollableState>(scroll);
+      await tester.drag(viewport, const Offset(-100, 0));
+      await tester.pumpAndSettle();
+
+      expect(state.position.pixels, greaterThan(50));
+      // And the table still owns no region of its own.
+      expect(
+        find.descendant(of: viewport, matching: find.byType(SelectableRegion)),
+        findsNothing,
+      );
+    });
+
+    testWidgets('gives its lazy code view the only region it shows', (
+      tester,
+    ) async {
+      // Past the threshold the body is a chunk viewport, which only builds the
+      // chunks it shows: nothing above it can reach the whole text, so the block
+      // owns its own selection and reports the claim (ADR-0010). Before this,
+      // every built chunk owned a region of its own, so one drag could not cross
+      // the viewport and the surface copied a silently truncated body.
+      final clipboard = _ClipboardText()..install(tester);
+      final code = List<String>.generate(
+        1050,
+        (index) => 'line$index',
+      ).join('\n');
+      await tester.pumpWidget(
+        _markdownHarness('```text\n$code\n```', width: 500),
+      );
+      await tester.pumpAndSettle();
+
+      final view = find.byKey(const ValueKey('virtualized-code-view'));
+      expect(view, findsOneWidget);
+      expect(find.byType(SelectableRegion), findsOneWidget);
+      expect(
+        find.ancestor(of: view, matching: find.byType(SelectableRegion)),
+        findsOneWidget,
+        reason: 'one region owns the whole viewport',
+      );
+
+      await _copyAllThroughToolbar(
+        tester,
+        tester.state<SelectableRegionState>(find.byType(SelectableRegion)),
+      );
+
+      expect(clipboard.value, contains('line0'));
+    });
+
+    testWidgets('keeps its lazy code view scrolling', (tester) async {
+      // The block's own selection area must not take the drag that scrolls the
+      // viewport: it is a 420-pixel window onto the whole body, and losing the
+      // scroll would cost more than the selection it buys.
+      final code = List<String>.generate(
+        1050,
+        (index) => 'line$index',
+      ).join('\n');
+      await tester.pumpWidget(
+        _markdownHarness('```text\n$code\n```', width: 500),
+      );
+      await tester.pumpAndSettle();
+
+      final view = find.byKey(const ValueKey('virtualized-code-view'));
+      final scroll = find
+          .descendant(of: view, matching: find.byType(Scrollable))
+          .first;
+      final state = tester.state<ScrollableState>(scroll);
+      await tester.drag(view, const Offset(0, -200));
+      await tester.pumpAndSettle();
+
+      expect(state.position.pixels, greaterThan(50));
+    });
+  });
+
   testWidgets(
     'MarkdownWithCodeHighlight keeps an unfinished streaming table row in table layout',
     (tester) async {
@@ -2237,25 +2442,12 @@ const greet = (name) => {
             .widgetList<RichText>(find.byType(RichText))
             .map((widget) => widget.text.toPlainText())
             .join('\n');
-        final codeText = tester
-            .widgetList<SelectableText>(
-              find.descendant(
-                of: find.byType(SelectableHighlightView),
-                matching: find.byType(SelectableText),
-              ),
-            )
-            .map((widget) => widget.textSpan?.toPlainText() ?? widget.data)
-            .join('\n');
+        final codeText = _codeText(
+          tester,
+          find.byType(SelectableHighlightView),
+        );
         final blockquote = find.byKey(const ValueKey('markdown-blockquote'));
-        final blockquoteCodeText = tester
-            .widgetList<SelectableText>(
-              find.descendant(
-                of: blockquote,
-                matching: find.byType(SelectableText),
-              ),
-            )
-            .map((widget) => widget.textSpan?.toPlainText() ?? widget.data)
-            .join('\n');
+        final blockquoteCodeText = _codeText(tester, blockquote);
 
         expect(allText, isNot(contains('| 混合')), reason: frame);
         expect(allText, isNot(contains('| 测试类别')), reason: frame);
@@ -2293,15 +2485,7 @@ const greet = (name) => {
       );
       await tester.pump();
 
-      final codeText = tester
-          .widgetList<SelectableText>(
-            find.descendant(
-              of: find.byType(SelectableHighlightView),
-              matching: find.byType(SelectableText),
-            ),
-          )
-          .map((widget) => widget.textSpan?.toPlainText() ?? widget.data)
-          .join('\n');
+      final codeText = _codeText(tester, find.byType(SelectableHighlightView));
 
       expect(codeText, contains('> ```bash'));
       expect(codeText, contains('> ```'));
@@ -2322,15 +2506,7 @@ final value = "$foo$";
       );
       await tester.pump();
 
-      final codeText = tester
-          .widgetList<SelectableText>(
-            find.descendant(
-              of: find.byType(SelectableHighlightView),
-              matching: find.byType(SelectableText),
-            ),
-          )
-          .map((widget) => widget.textSpan?.toPlainText() ?? widget.data)
-          .join('\n');
+      final codeText = _codeText(tester, find.byType(SelectableHighlightView));
 
       expect(_findMathWidget(), findsNothing);
       expect(codeText, contains(r'final value = "$foo$";'));
@@ -3626,8 +3802,7 @@ final price = "$12";
       ),
     );
 
-    final richText = tester.widget<SelectableText>(find.byType(SelectableText));
-    final root = richText.textSpan!;
+    final root = _codeSpan(tester, find.byType(SelectableHighlightView));
     final children = root.children ?? const <InlineSpan>[];
 
     expect(children, isNotEmpty);
@@ -3654,195 +3829,21 @@ final price = "$12";
       ),
     );
 
-    final before = tester
-        .widget<SelectableText>(find.byType(SelectableText))
-        .textSpan!
-        .children;
+    final before = _codeSpan(
+      tester,
+      find.byType(SelectableHighlightView),
+    ).children;
 
     rebuild(() {});
     await tester.pump();
 
-    final after = tester
-        .widget<SelectableText>(find.byType(SelectableText))
-        .textSpan!
-        .children;
+    final after = _codeSpan(
+      tester,
+      find.byType(SelectableHighlightView),
+    ).children;
 
     expect(identical(before, after), isTrue);
   });
-
-  testWidgets(
-    'SelectableHighlightView adds iOS native translation for non-empty selection',
-    (tester) async {
-      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
-      addTearDown(() => debugDefaultTargetPlatformOverride = null);
-      const channel = MethodChannel('app.ios_translation');
-      final calls = <MethodCall>[];
-      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-          .setMockMethodCallHandler(channel, (call) async {
-            calls.add(call);
-            return call.method == 'isAvailable' ? true : null;
-          });
-      addTearDown(
-        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-            .setMockMethodCallHandler(channel, null),
-      );
-
-      await tester.pumpWidget(
-        const MaterialApp(
-          localizationsDelegates: AppLocalizations.localizationsDelegates,
-          supportedLocales: AppLocalizations.supportedLocales,
-          home: Scaffold(
-            body: SelectableHighlightView(
-              'final value = 1;',
-              language: 'dart',
-              theme: {},
-            ),
-          ),
-        ),
-      );
-      await tester.pump();
-
-      final editableTextState = tester.state<EditableTextState>(
-        find.byType(EditableText),
-      );
-      final contextMenuBuilder = tester
-          .widget<SelectableText>(find.byType(SelectableText))
-          .contextMenuBuilder!;
-      final editableContext = tester.element(find.byType(EditableText));
-
-      final collapsedMenu =
-          contextMenuBuilder(editableContext, editableTextState)
-              as AdaptiveTextSelectionToolbar;
-      expect(
-        collapsedMenu.buttonItems,
-        isNot(
-          contains(
-            predicate<ContextMenuButtonItem>((item) {
-              return item.label == 'Translate';
-            }),
-          ),
-        ),
-      );
-
-      editableTextState.userUpdateTextEditingValue(
-        editableTextState.textEditingValue.copyWith(
-          selection: const TextSelection(baseOffset: 0, extentOffset: 5),
-        ),
-        SelectionChangedCause.longPress,
-      );
-      await tester.pump();
-
-      final selectionMenu =
-          contextMenuBuilder(editableContext, editableTextState)
-              as AdaptiveTextSelectionToolbar;
-      final translateItem = selectionMenu.buttonItems!.singleWhere(
-        (item) => item.label == 'Translate',
-      );
-      translateItem.onPressed!();
-      await tester.pump();
-
-      final presentCall = calls.singleWhere((call) => call.method == 'present');
-      final arguments = presentCall.arguments as Map<Object?, Object?>;
-      expect(arguments['text'], 'final');
-      expect(arguments['anchorX'], isA<double>());
-      expect(arguments['anchorY'], isA<double>());
-      debugDefaultTargetPlatformOverride = null;
-    },
-  );
-
-  testWidgets(
-    'SelectableHighlightView keeps stock menu when iOS translation is unavailable',
-    (tester) async {
-      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
-      addTearDown(() => debugDefaultTargetPlatformOverride = null);
-      const channel = MethodChannel('app.ios_translation');
-      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-          .setMockMethodCallHandler(channel, (call) async => false);
-      addTearDown(
-        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-            .setMockMethodCallHandler(channel, null),
-      );
-
-      await tester.pumpWidget(
-        const MaterialApp(
-          home: Scaffold(
-            body: SelectableHighlightView(
-              'final value = 1;',
-              language: 'dart',
-              theme: {},
-            ),
-          ),
-        ),
-      );
-      await tester.pump();
-
-      final editableTextState = tester.state<EditableTextState>(
-        find.byType(EditableText),
-      );
-      editableTextState.userUpdateTextEditingValue(
-        editableTextState.textEditingValue.copyWith(
-          selection: const TextSelection(baseOffset: 0, extentOffset: 5),
-        ),
-        SelectionChangedCause.longPress,
-      );
-      await tester.pump();
-      final menu =
-          tester
-              .widget<SelectableText>(find.byType(SelectableText))
-              .contextMenuBuilder!(
-            tester.element(find.byType(EditableText)),
-            editableTextState,
-          );
-
-      expect(menu, isA<AdaptiveTextSelectionToolbar>());
-      expect(
-        (menu as AdaptiveTextSelectionToolbar).buttonItems,
-        isNot(
-          contains(
-            predicate<ContextMenuButtonItem>((item) {
-              return item.label == 'Translate';
-            }),
-          ),
-        ),
-      );
-      debugDefaultTargetPlatformOverride = null;
-    },
-  );
-
-  testWidgets(
-    'SelectableHighlightView does not query native translation off iOS',
-    (tester) async {
-      debugDefaultTargetPlatformOverride = TargetPlatform.android;
-      addTearDown(() => debugDefaultTargetPlatformOverride = null);
-      const channel = MethodChannel('app.ios_translation');
-      final calls = <MethodCall>[];
-      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-          .setMockMethodCallHandler(channel, (call) async {
-            calls.add(call);
-            return true;
-          });
-      addTearDown(
-        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-            .setMockMethodCallHandler(channel, null),
-      );
-
-      await tester.pumpWidget(
-        const MaterialApp(
-          home: Scaffold(
-            body: SelectableHighlightView(
-              'final value = 1;',
-              language: 'dart',
-              theme: {},
-            ),
-          ),
-        ),
-      );
-      await tester.pump();
-
-      expect(calls, isEmpty);
-      debugDefaultTargetPlatformOverride = null;
-    },
-  );
 
   testWidgets(
     'SelectableHighlightView skips synchronous highlighting on demand',
@@ -3860,10 +3861,7 @@ final price = "$12";
         ),
       );
 
-      final richText = tester.widget<SelectableText>(
-        find.byType(SelectableText),
-      );
-      final root = richText.textSpan!;
+      final root = _codeSpan(tester, find.byType(SelectableHighlightView));
       final children = root.children ?? const <InlineSpan>[];
 
       expect(children, hasLength(1));
@@ -3882,13 +3880,7 @@ final value = 1;
       );
       await tester.pump();
 
-      final richText = tester.widget<SelectableText>(
-        find.descendant(
-          of: find.byType(SelectableHighlightView),
-          matching: find.byType(SelectableText),
-        ),
-      );
-      final root = richText.textSpan!;
+      final root = _codeSpan(tester, find.byType(SelectableHighlightView));
       final children = root.children ?? const <InlineSpan>[];
 
       expect(children.length, greaterThan(1));
@@ -5156,12 +5148,7 @@ void main() {
       await tester.pump();
 
       Set<Color?> codeSpanColors() {
-        final richText = tester.widget<SelectableText>(
-          find.descendant(
-            of: find.byType(SelectableHighlightView),
-            matching: find.byType(SelectableText),
-          ),
-        );
+        final span = _codeSpan(tester, find.byType(SelectableHighlightView));
         final colors = <Color?>{};
         void walk(InlineSpan span) {
           if (span is! TextSpan) return;
@@ -5169,7 +5156,7 @@ void main() {
           span.children?.forEach(walk);
         }
 
-        walk(richText.textSpan!);
+        walk(span);
         return colors;
       }
 
@@ -5369,21 +5356,15 @@ Fenced code body
       inheritedInk,
     );
     expect(tester.widget<Text>(find.text('code')).style?.color, inheritedInk);
+    expect(_inkOf(_paragraphContaining('Theme table header')), themeInk);
     expect(
-      _paragraphContaining('Theme table header').text.style?.color,
-      themeInk,
-    );
-    expect(
-      _paragraphContaining('Theme table body').text.style?.color,
+      _inkOf(_paragraphContaining('Theme table body')),
       themeInk.withValues(alpha: 0.90),
     );
-    final fencedCode = tester.widget<SelectableText>(
-      find.descendant(
-        of: find.byType(SelectableHighlightView),
-        matching: find.byType(SelectableText),
-      ),
+    expect(
+      _codeSpan(tester, find.byType(SelectableHighlightView)).style?.color,
+      themeInk,
     );
-    expect(fencedCode.textSpan?.style?.color, themeInk);
   });
 
   testWidgets(
