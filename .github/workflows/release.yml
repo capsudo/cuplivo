@@ -128,6 +128,9 @@ jobs:
       - name: 🏗️ 构建 APK
         run: flutter build apk --release --split-per-abi
 
+      - name: Check release JNI entry points
+        run: python3 tool/check_android_jni_abi.py build/app/outputs/flutter-apk/app-*-release.apk
+
       - name: 📦 重命名 APK
         run: |
           cd build/app/outputs/flutter-apk

@@ -211,6 +211,17 @@ flutter pub get
 flutter run
 ```
 
+For Android release builds, check the shrunk APKs before installing or distributing them:
+
+```bash
+flutter build apk --release --split-per-abi
+python3 tool/check_android_jni_abi.py build/app/outputs/flutter-apk/app-*-release.apk
+```
+
+The release workflow runs this check to preserve the Kotlin entry points accessed by Pigeon JNI.
+Also verify a fresh launch and a second launch on an Android device or emulator. Flutter widget
+tests and Android JVM unit tests do not exercise the shrunk release APK or its native JNI bridge.
+
 Several packages are vendored under [`dependencies/`](dependencies) and referenced by path, so no extra setup is needed for them. See [AGENTS.md](AGENTS.md) for the project structure and code conventions.
 
 ## 🤝 Contributing
