@@ -109,6 +109,22 @@ jobs:
           echo "keyAlias=${{ secrets.KEY_ALIAS }}" >> android/key.properties
           echo "keyPassword=${{ secrets.KEY_PASSWORD }}" >> android/key.properties
           echo "✅ 签名配置已写入"
+      - name: 🔏 Sign test APKs when no release key is configured
+        if: ${{ github.event.inputs.publish_release != 'true' }}
+        run: |
+          if [ -f android/key.properties ]; then
+            exit 0
+          fi
+          keytool -genkeypair -noprompt \
+            -keystore android/app/test-signing.jks \
+            -storepass android -keypass android \
+            -alias androiddebugkey -keyalg RSA -keysize 2048 \
+            -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          printf '%s\n' \
+            'storeFile=test-signing.jks' \
+            'storePassword=android' \
+            'keyAlias=androiddebugkey' \
+            'keyPassword=android' > android/key.properties
       - name: 🏗️ 构建 APK
         run: flutter build apk --release --split-per-abi
 
